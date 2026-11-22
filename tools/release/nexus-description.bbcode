@@ -1,0 +1,57 @@
+[size=5][b]bms-dlss – DLSS, DLAA, FSR and Frame Generation for Black Mesa[/b][/size]
+
+Replaces Black Mesa's anti-aliasing with [b]NVIDIA DLSS / DLAA[/b] or [b]AMD FSR[/b] and adds [b]frame generation[/b] (NVIDIA DLSS Frame Generation or FSR). A much cleaner image on fences, wires and grates, and smooth high frame rates on high refresh rate monitors.
+
+[size=4][b]Features[/b][/size]
+[list]
+[*][b]DLAA[/b] (DLSS at native resolution) and [b]DLSS supersampling[/b] (renders larger and scales down, like DLDSR – the cleanest fences). DLSS presets K, L, M.
+[*][b]AMD FSR[/b] upscaling for any graphics card with Vulkan.
+[*][b]Frame Generation[/b]:
+[list]
+[*][b]DLSS-G[/b] (RTX 40 and newer): 2×, on [b]RTX 50 up to 6×[/b].
+[*][b]FSR[/b] (any card with Vulkan – RTX 20/30, AMD, Intel): 2× and [b]3×–5×[/b] with the mod's own FSR-based generator.
+[*][b]FSR adaptive[/b]: generates only the frames that are missing to reach the target.
+[*][b]Auto multiplier[/b]: the lowest multiplier that reaches your output frame rate – real frames first.
+[*]Output FPS cap (default: just below your refresh rate, works with G-SYNC / FreeSync).
+[/list]
+[*]Motion vectors for moving objects and the weapon in hand (less ghosting).
+[*]Latency reduction similar to NVIDIA Reflex when the GPU is the bottleneck.
+[*]In-game menu ([b]Alt+N[/b]) in English and Czech.
+[/list]
+
+[size=4][b]Requirements[/b][/size]
+[list]
+[*]Black Mesa from Steam, current Windows version.
+[*]Graphics card with Vulkan. DLSS / DLAA: NVIDIA RTX. DLSS Frame Generation: RTX 40+ (more than 2×: RTX 50). FSR: any Vulkan GPU.
+[*]For DLSS-G: Windows hardware-accelerated GPU scheduling on.
+[*]In-game anti-aliasing (MSAA) [b]off[/b].
+[/list]
+
+[size=4][b]Installation[/b][/size]
+[list=1]
+[*]Close the game.
+[*]Steam > Black Mesa > Manage > Browse local files. Extract the zip there (a [i]bms-dlss[/i] folder appears next to bms.exe).
+[*]Run [b]bms-dlss\install.bat[/b].
+[*]Start the game with the Steam launch option [b]"Play DXVK"[/b] (Properties > General > Launch options). With "Play Black Mesa" the mod is not loaded.
+[*]In game: [b]Alt+N[/b] = menu, [b]Alt+F8[/b] = mod on/off.
+[/list]
+After a game update or "Verify integrity of game files", run install.bat again (settings are kept). Uninstall: [b]bms-dlss\uninstall.bat[/b].
+
+[size=4][b]Known limitations[/b][/size]
+[list]
+[*]Frame generation: a thin halo around the weapon and hands during fast turns.
+[*]DLSS-G uses the driver's own frame generation preset; NVIDIA App / Profile Inspector preset overrides may not apply.
+[*]FSR 3×–5× blends very fast effects (the tau cannon beam may look doubled in generated frames).
+[*]The DLLs are not code-signed and the menu uses a keyboard hook while the game runs – some antivirus programs may warn. SHA256 checksums are included.
+[*]VirusTotal scan of bms-dlss-1.0.0.zip: [b]0 / 61[/b] – [url=https://www.virustotal.com/gui/file/4f60116db0ed625fe206eb25f2220dd7cce9c4a15e71a3d53cf3bb1cbb5e7d5c/detection]report[/url] (SHA256 4f60116db0ed625fe206eb25f2220dd7cce9c4a15e71a3d53cf3bb1cbb5e7d5c).
+[*]Do not use in multiplayer.
+[/list]
+
+[size=4][b]Credits[/b][/size]
+Made by [b]Crashdown[/b]. Uses [b]NVIDIA DLSS[/b] (NVIDIA RTX SDK), [b]AMD FidelityFX FSR[/b] (AMD FidelityFX SDK) and the game's [b]DXVK[/b]. Mod code under the MIT License; third-party licenses in THIRD_PARTY_NOTICES.md.
+Unofficial mod, not affiliated with or endorsed by Crowbar Collective, NVIDIA or AMD.
+
+[line]
+
+[size=4][b]Česky[/b][/size]
+Mod nahradí vyhlazování Black Mesa za [b]NVIDIA DLSS / DLAA[/b] nebo [b]AMD FSR[/b] a přidá [b]generování snímků[/b] (DLSS-G až 6× na RTX 50, FSR 2× a 3×–5× na všech kartách s Vulkanem, násobek Auto). Instalace: rozbal zip do složky hry, spusť [b]bms-dlss\install.bat[/b] a hru spouštěj volbou Steamu [b]„Hrát DXVK“[/b]. Ve hře [b]Alt+N[/b] = menu (česky). Podrobnosti v README.md v balíku.

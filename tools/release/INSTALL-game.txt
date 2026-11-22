@@ -1,0 +1,46 @@
+bms-dlss {VERSION} - DLSS / DLAA / FSR and frame generation for Black Mesa (Windows, Steam)
+===========================================================================================
+
+ENGLISH
+-------
+This package is meant to be extracted directly into the game folder. It contains its own
+copy of DXVK {DXVK} (bin\thirdparty\dxvk-windows-x86\d3d9_dxvk.dll, zlib license, see
+bms-dlss\DXVK-LICENSE.txt) and replaces the game's d3d9.dll with the bms-dlss proxy.
+
+Install
+1. Close the game.
+2. Steam > Black Mesa > Manage > Browse local files. Extract this zip into that folder and
+   confirm overwriting. When updating the mod, do NOT overwrite your
+   bin\thirdparty\dxvk-windows-x86\bms_dlss.ini if you changed settings.
+3. Optional (F4 = upscaling mode): add the line "exec bms_dlss_upscale" to
+   bms\cfg\autoexec.cfg (create the file if it does not exist).
+4. Start the game with the Steam launch option "Play DXVK". With the default option the
+   mod is not loaded.
+5. In game: Alt+N opens the bms-dlss menu, Alt+F8 turns the mod on/off.
+
+Uninstall: Steam > Black Mesa > Properties > Installed files > Verify integrity of game
+files (restores the game's own d3d9.dll), then remove the "exec bms_dlss_upscale" line
+from autoexec.cfg and run "mat_viewportscale 1" in the game console once.
+
+CESKY
+-----
+Balicek se rozbaluje primo do slozky hry. Obsahuje vlastni kopii DXVK {DXVK}
+(bin\thirdparty\dxvk-windows-x86\d3d9_dxvk.dll, licence zlib, viz
+bms-dlss\DXVK-LICENSE.txt) a d3d9.dll hry nahradi proxy bms-dlss.
+
+Instalace
+1. Zavri hru.
+2. Steam > Black Mesa > Spravovat > Prochazet mistni soubory. Do teto slozky rozbal zip
+   a potvrd prepsani. Pri aktualizaci modu NEPREPISUJ svuj
+   bin\thirdparty\dxvk-windows-x86\bms_dlss.ini, pokud jsi menil nastaveni.
+3. Volitelne (F4 = usporny rezim): do bms\cfg\autoexec.cfg pridej radek
+   "exec bms_dlss_upscale" (soubor pripadne vytvor).
+4. Hru spoustej volbou Steamu "Hrat DXVK". Pri vychozi volbe se mod nenacte.
+5. Ve hre: Alt+N otevre menu modu, Alt+F8 mod zapne / vypne.
+
+Odinstalace: Steam > Black Mesa > Vlastnosti > Nainstalovane soubory > Overit integritu
+souboru hry (vrati vlastni d3d9.dll hry), pak z autoexec.cfg odeber radek
+"exec bms_dlss_upscale" a v konzoli hry jednou zadej "mat_viewportscale 1".
+
+Licenses / Licence: LICENSE (MIT), THIRD_PARTY_NOTICES.md, DXVK-LICENSE.txt.
+Unofficial mod, not affiliated with Crowbar Collective, NVIDIA or AMD.

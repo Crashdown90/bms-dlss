@@ -1,0 +1,82 @@
+bms-dlss {VERSION} - DLSS / DLAA / FSR and frame generation for Black Mesa (Windows, Steam)
+===========================================================================================
+
+ENGLISH
+-------
+Requirements
+- Black Mesa from Steam, current version for Windows (the game folder must contain
+  bin\thirdparty\dxvk-windows-x86\d3d9.dll; it comes with the game).
+- Graphics card with Vulkan. DLSS / DLAA / DLSS Frame Generation: NVIDIA GeForce RTX
+  (DLSS-G is RTX 40+, more than 2x up to 6x: RTX 50 series). FSR upscaling and FSR frame
+  generation (2x, 3x-5x with the mod's own generator): any card with Vulkan.
+- In the game options: anti-aliasing (MSAA) off. The mod replaces it.
+
+Install
+1. Close the game.
+2. Steam > Black Mesa > Manage > Browse local files. Extract this zip into that folder
+   (you get a "bms-dlss" folder next to bms.exe).
+3. Run bms-dlss\install.bat. It renames the game's DXVK d3d9.dll to d3d9_dxvk.dll
+   (backup d3d9.dll.original), copies the mod next to it and adds the F4 key for the
+   upscaling mode (bms\cfg\bms_dlss_upscale.cfg + one line in autoexec.cfg).
+4. Start the game with the Steam launch option "Play DXVK". If Steam does not ask:
+   Black Mesa > Properties > General > Launch options / "Selected launch option" > DXVK.
+   With the default option ("Play Black Mesa") the game does not use DXVK and the mod
+   is not loaded at all (no error, just no effect).
+5. In game: Alt+N opens the bms-dlss menu, Alt+F8 turns the mod on/off.
+
+After a game update or "Verify integrity of game files"
+- Steam may put the original DXVK d3d9.dll back; the mod is then inactive. Run
+  bms-dlss\install.bat again (your settings in bms_dlss.ini are kept).
+
+Uninstall
+- Close the game and run bms-dlss\uninstall.bat. It restores the original DXVK, removes
+  the DLSS / FSR libraries and the F4 line from autoexec.cfg. Alternatively: Steam >
+  Verify integrity of game files (leftover files of the mod are then unused).
+
+Notes
+- bms_dlss_helper.exe and d3d9.dll are not code-signed. The menu uses a keyboard hook
+  (only while the game runs). Some antivirus programs may warn about such files; the
+  SHA256 checksums of all files are in SHA256SUMS.txt.
+- Do not use the mod in multiplayer.
+- Licenses: LICENSE (MIT, mod code) and THIRD_PARTY_NOTICES.md (NVIDIA DLSS, AMD FSR,
+  DXVK, Vulkan). Unofficial mod, not affiliated with Crowbar Collective, NVIDIA or AMD.
+
+CESKY
+-----
+Pozadavky
+- Black Mesa ze Steamu, aktualni verze pro Windows (ve slozce hry musi byt
+  bin\thirdparty\dxvk-windows-x86\d3d9.dll; je soucasti hry).
+- Graficka karta s Vulkanem. DLSS / DLAA / DLSS Frame Generation: NVIDIA GeForce RTX
+  (DLSS-G od RTX 40, vic nez 2x az 6x: rada RTX 50). FSR upscaling a FSR Frame Generation
+  (2x, 3x-5x vlastnim generatorem modu): libovolna karta s Vulkanem.
+- V nastaveni hry vypni vyhlazovani (MSAA), mod ho nahrazuje.
+
+Instalace
+1. Zavri hru.
+2. Steam > Black Mesa > Spravovat > Prochazet mistni soubory. Do teto slozky rozbal zip
+   (vznikne slozka "bms-dlss" vedle bms.exe).
+3. Spust bms-dlss\install.bat. Prejmenuje d3d9.dll z DXVK hry na d3d9_dxvk.dll (zaloha
+   d3d9.dll.original), zkopiruje vedle nej mod a prida klavesu F4 pro usporny rezim
+   (bms\cfg\bms_dlss_upscale.cfg + jeden radek v autoexec.cfg).
+4. Hru spoustej volbou Steamu "Hrat DXVK" ("Play DXVK"). Kdyz se Steam nepta:
+   Black Mesa > Vlastnosti > Obecne > Moznosti spusteni / "Zvolena moznost spusteni" > DXVK.
+   Pri vychozi volbe ("Hrat Black Mesa") hra DXVK nepouzije a mod se vubec nenacte
+   (zadna chyba, jen nic nedela).
+5. Ve hre: Alt+N otevre menu modu, Alt+F8 mod zapne / vypne.
+
+Po aktualizaci hry nebo "Overit integritu souboru"
+- Steam muze vratit puvodni d3d9.dll z DXVK a mod pak nejede. Spust znovu
+  bms-dlss\install.bat (nastaveni v bms_dlss.ini zustane).
+
+Odinstalace
+- Zavri hru a spust bms-dlss\uninstall.bat. Vrati puvodni DXVK, odebere knihovny DLSS /
+  FSR a radek F4 z autoexec.cfg. Jinak: Steam > Overit integritu souboru hry (zbyle
+  soubory modu se pak nepouzivaji).
+
+Poznamky
+- bms_dlss_helper.exe a d3d9.dll nejsou digitalne podepsane. Menu pouziva hacek
+  klavesnice (jen za behu hry). Nektere antiviry mohou varovat; kontrolni soucty SHA256
+  vsech souboru jsou v SHA256SUMS.txt.
+- Mod nepouzivej v multiplayeru.
+- Licence: LICENSE (MIT, kod modu) a THIRD_PARTY_NOTICES.md (NVIDIA DLSS, AMD FSR, DXVK,
+  Vulkan). Neoficialni mod, bez vztahu ke Crowbar Collective, NVIDIA a AMD.

@@ -1,0 +1,36 @@
+// bms-dlss: VERSIONINFO pro 32bitovou proxy d3d9.dll (preklad: rc.exe /nologo /fo build\d3d9.res src\res\d3d9.rc,
+// pak build\d3d9.res pridat do radku cl ... /link; postup v docs/priprava-vydani.md).
+#include <winver.h>
+#include "version.h"
+
+LANGUAGE 0x09, 0x01  // LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    BMSDLSS_VER_MAJOR, BMSDLSS_VER_MINOR, BMSDLSS_VER_PATCH, BMSDLSS_VER_BUILD
+ PRODUCTVERSION BMSDLSS_VER_MAJOR, BMSDLSS_VER_MINOR, BMSDLSS_VER_PATCH, BMSDLSS_VER_BUILD
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_DLL
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      BMSDLSS_COMPANY
+            VALUE "FileDescription",  "bms-dlss Direct3D 9 proxy for Black Mesa (forwards to DXVK)"
+            VALUE "FileVersion",      BMSDLSS_VER_STR
+            VALUE "InternalName",     "bms-dlss-proxy"
+            VALUE "LegalCopyright",   BMSDLSS_COPYRIGHT
+            VALUE "OriginalFilename", "d3d9.dll"
+            VALUE "ProductName",      BMSDLSS_PRODUCT
+            VALUE "ProductVersion",   BMSDLSS_VER_STR
+            VALUE "Comments",         BMSDLSS_COMMENTS
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

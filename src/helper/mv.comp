@@ -1,0 +1,146 @@
+// bms-dlss: motion vektory z hloubky a kamer (pohyb kamery), krok 3c; od verze 9 navic MV pohyblivych objektu
+// z obrazu OBJMV_IN, ktery kresli proxy (src/objmv.inl).
+//
+// Pro kazdy pixel: hardwarova hloubka (D24, z/w v 0..1, near = 0) -> bod v clip prostoru
+// tohoto snimku (bez jitteru) -> reprojekce matici "clip -> clip minuleho snimku"
+// (prevCam * inverse(cam), pocitano v double na CPU) -> pozice v minulem snimku.
+// MV = pozice v minulem snimku - pozice v tomto snimku, v pixelech (+x doprava, +y dolu),
+// tedy vektor z aktualniho pixelu na jeho misto v minulem snimku (konvence DLSS).
+//
+// D3D9 (a DXVK, ktery jeho pravidla emuluje): stred pixelu (i, j) odpovida NDC (2i/W - 1, 1 - 2j/H).
+// Jitter posouva obraz o (+jx, +jy) pixelu, takze bod videny v pixelu (i, j) je bez jitteru v (i, j) - j.
+// Zbran v ruce se kresli s viewportem MinZ = 0, MaxZ = 0.1 a hybe se s kamerou: hloubka <= vmDepth
+// -> MV = 0 (svet tak blizko u kamery prakticky neni, near plane Source je asi 7 jednotek).
+//
+// MV pohyblivych objektu (objMode != 0): OBJMV_IN ma v RG motion vektor ve stejne konvenci, v B hloubku z/w
+// fragmentu objektu a v A 0 = nic, 1 = pohyblivy objekt, 2 = staticky objekt (jen validace). Poradi:
+//   zbran v ruce -> MV = 0; jinak A > 0.5 a |d_obj - d_buf| <= max(1e-6, tol * (1 - d_buf)) -> MV objektu;
+//   jinak MV kamery (objekt je v tom pixelu zakryty necim, co proxy neprehrala).
+// Tolerance je relativni k (1 - d) ~ near / vzdalenost, tedy ke vzdalenosti od kamery.
+// Pocitadla (ObjStats, atomicky, 64 kosu podle pixelu kvuli soubehu a rozsahu uint): prijate a odmitnute pixely;
+// pri validaci (objMode bit 1) u statickych objektu |MV objektu - MV kamery| v 1/256 px (soucet, pocet, maximum)
+// a pocet jejich pixelu odmitnutych hloubkou (chyba jitteru nebo rasterizace replaye = odmitnuti na hranach).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D uDepth;           // DEPTH_IN, aspekt hloubky
+layout(binding = 1) uniform sampler2D uColor;           // COLOR_IN (jen pro ladici zobrazeni)
+// Vystup MV: vlastni set 1 (od v24y) - helper do nej dava g_mvImg, nebo s FG primo obraz MV snapshotu (bez kopie)
+layout(set = 1, binding = 0, rg32f) uniform writeonly image2D uMV;
+layout(binding = 3, rgba8) uniform writeonly image2D uDebug;
+layout(binding = 9) uniform sampler2D uObj;             // OBJMV_IN (RGBA32F), cte se jen pri objMode != 0
+// Pocitadla MV objektu, na slot 6 poli po 64 kosich: prijato, odmitnuto hloubkou, validace pocet / soucet / maximum,
+// validace odmitnuto hloubkou
+layout(std430, binding = 10) buffer ObjStats { uint v[]; } st;
+// Mereni MV zbrane (ViewmodelCheck, v25a): jas minuleho snimku (cteni) a tohoto snimku (zapis), stridave 0 / 1
+layout(binding = 13) uniform sampler2D uPrev[2];
+layout(binding = 14, r32f) uniform writeonly image2D uPrevW[2];
+
+layout(push_constant) uniform Push {
+    vec4 r0, r1, r2, r3;  // radky matice clip -> clip minuleho snimku
+    vec2 size;            // sirka, vyska v pixelech
+    vec2 jitter;          // jitter tohoto snimku v pixelech (+x doprava, +y dolu)
+    float debugScale;     // > 0: zapsat vizualizaci 0.5 + mv * debugScale do uDebug
+    uint valid;           // 0 = kamera neni platna -> MV = 0
+    float vmDepth;        // > 0: hloubka <= vmDepth je zbran v ruce -> MV = 0
+    uint objMode;         // BMSD_OBJMV_*: 0 = OBJMV_IN necist, bit 0 = pouzit MV objektu, bit 1 = validace,
+                          // bit 2 = i zbran v ruce (proxy ji prehrava s viewportem Z 0..0.1, B ve stejne skale)
+    float objTol;         // tolerance hloubky objektu, relativne k (1 - d)
+    uint statBase;        // zacatek pocitadel tohoto slotu v ObjStats
+    vec2 prevJitter;      // jitter minuleho snimku (ViewmodelCheck)
+    uint vmCheck;         // bit 0 = zapsat jas do uPrevW[bit 2], bit 1 = cist minuly z uPrev[bit 2 ^ 1]
+} pc;
+
+float PrevLum(ivec2 q) {
+    q = clamp(q, ivec2(0), ivec2(pc.size) - 1);
+    return (pc.vmCheck & 4u) != 0u ? texelFetch(uPrev[0], q, 0).r : texelFetch(uPrev[1], q, 0).r;
+}
+// bilinearne v pixelech minuleho snimku (x = stred pixelu 0 -> 0.0)
+float PrevLumBilin(vec2 x) {
+    vec2 f = floor(x);
+    vec2 t = x - f;
+    ivec2 i = ivec2(f);
+    return mix(mix(PrevLum(i), PrevLum(i + ivec2(1, 0)), t.x), mix(PrevLum(i + ivec2(0, 1)), PrevLum(i + ivec2(1, 1)), t.x),
+               t.y);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.size.x) || p.y >= int(pc.size.y)) return;
+
+    vec2 mv = vec2(0.0);
+    float rawDepth = texelFetch(uDepth, p, 0).r;
+    bool viewmodel = pc.vmDepth > 0.0 && rawDepth <= pc.vmDepth;
+    if (pc.valid != 0u && !viewmodel) {
+        // 1.0 = obloha / smazana hloubka; kousek pred far, at to funguje i s nekonecnou projekci
+        float d = min(rawDepth, 0.999999);
+        vec2 cur = vec2(p) - pc.jitter;  // pozice bez jitteru v pixelech
+        vec4 clip = vec4(2.0 * cur.x / pc.size.x - 1.0, 1.0 - 2.0 * cur.y / pc.size.y, d, 1.0);
+        vec4 prev = vec4(dot(pc.r0, clip), dot(pc.r1, clip), dot(pc.r2, clip), dot(pc.r3, clip));
+        if (prev.w > 1e-6) {
+            vec2 ndc = prev.xy / prev.w;
+            vec2 prevPix = vec2((ndc.x + 1.0) * 0.5 * pc.size.x, (1.0 - ndc.y) * 0.5 * pc.size.y);
+            mv = prevPix - cur;
+        }
+    }
+
+    // MV pohybliveho objektu misto MV kamery (zbran v ruce zustava na 0, pokud ji proxy neprehrava - objMode bit 2)
+    int objState = 0;  // 0 = MV kamery, 1 = MV objektu prijato, 2 = objekt v pixelu je, ale nesedi hloubka
+    if (pc.objMode != 0u && (!viewmodel || (pc.objMode & 4u) != 0u)) {
+        vec4 o = texelFetch(uObj, p, 0);
+        if (o.a > 0.5) {
+            uint bucket = pc.statBase + uint((p.x & 7) | ((p.y & 7) << 3));
+            if (abs(o.b - rawDepth) <= max(1e-6, pc.objTol * (1.0 - rawDepth))) {
+                objState = 1;
+                atomicAdd(st.v[bucket], 1u);
+                if ((pc.objMode & 2u) != 0u && o.a > 1.5) {
+                    // validace: staticky objekt, MV objektu ma vyjit stejne jako MV kamery (v mv je ted MV kamery)
+                    uint q = uint(min(length(o.rg - mv), 64.0) * 256.0 + 0.5);
+                    atomicAdd(st.v[bucket + 128u], 1u);
+                    atomicAdd(st.v[bucket + 192u], q);
+                    atomicMax(st.v[bucket + 256u], q);
+                }
+                mv = o.rg;
+            } else {
+                objState = 2;
+                atomicAdd(st.v[bucket + 64u], 1u);
+                if ((pc.objMode & 2u) != 0u && o.a > 1.5) atomicAdd(st.v[bucket + 320u], 1u);  // staticky objekt
+            }
+        }
+    }
+    imageStore(uMV, p, vec4(mv, 0.0, 0.0));
+
+    // Mereni MV zbrane: pokryti, |MV| a fotometricka chyba (jas minuleho snimku v miste p + MV proti p + 0)
+    if (viewmodel && pc.objMode != 0u && (pc.objMode & 4u) != 0u) {
+        uint bk = pc.statBase + uint((p.x & 7) | ((p.y & 7) << 3));
+        atomicAdd(st.v[bk + 384u], 1u);
+        if (objState == 1) {
+            atomicAdd(st.v[bk + 448u], 1u);
+            atomicAdd(st.v[bk + 512u], uint(min(length(mv), 64.0) * 256.0 + 0.5));
+            if ((pc.vmCheck & 2u) != 0u) {
+                float lc = dot(texelFetch(uColor, p, 0).rgb, vec3(0.299, 0.587, 0.114));
+                vec2 base = vec2(p) - pc.jitter + pc.prevJitter;  // pixel minuleho snimku pro MV = 0
+                float e1 = abs(lc - PrevLumBilin(base + mv));
+                float e0 = abs(lc - PrevLumBilin(base));
+                atomicAdd(st.v[bk + 576u], uint(e1 * 1024.0 + 0.5));
+                atomicAdd(st.v[bk + 640u], uint(e0 * 1024.0 + 0.5));
+            }
+        }
+    }
+    if ((pc.vmCheck & 1u) != 0u) {
+        float l = dot(texelFetch(uColor, p, 0).rgb, vec3(0.299, 0.587, 0.114));
+        if ((pc.vmCheck & 4u) != 0u) imageStore(uPrevW[1], p, vec4(l));
+        else imageStore(uPrevW[0], p, vec4(l));
+    }
+
+    if (pc.debugScale > 0.0) {
+        vec3 c = texelFetch(uColor, p, 0).rgb;
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        // Modra: jas sceny (MV kamery), plna = MV objektu prijato, srafovani 2x2 px = objekt odmitnuty hloubkou
+        float b = 0.6 * l;
+        if (objState == 1) b = 1.0;
+        else if (objState == 2) b = (((p.x >> 1) + (p.y >> 1)) & 1) != 0 ? 1.0 : 0.0;
+        imageStore(uDebug, p, vec4(clamp(vec2(0.5) + mv * pc.debugScale, 0.0, 1.0), b, 1.0));
+    }
+}

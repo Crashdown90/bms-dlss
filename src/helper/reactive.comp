@@ -1,0 +1,25 @@
+// bms-dlss: maska reaktivity pro FSR (reactive) a DLSS (Bias Current Color Mask).
+//
+// Vstup MASK_IN (B8G8R8A8 z proxy, src/reactive.inl): RGB = pridana barva aditivnich draw (ohen, jiskry, zablesky),
+// A = pokryti pruhlednych draw (kour, prach, sklo). Vystup R8: min(max(max(R, G, B), A) * scale, maxValue).
+// Pocita se jen render (cast B: sub-rect od (0, 0)), zbytek obrazu FSR / DLSS necte.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 11) uniform sampler2D uMask;             // MASK_IN (layout GENERAL)
+layout(binding = 12, r8) uniform writeonly image2D uOut;   // maska pro FSR / DLSS
+
+layout(push_constant) uniform Push {
+    uint w, h;       // render
+    float scale;     // [upscale] ReactiveScale
+    float maxValue;  // [upscale] ReactiveMax
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.w) || p.y >= int(pc.h)) return;
+    vec4 m = texelFetch(uMask, p, 0);
+    float r = max(max(m.r, m.g), max(m.b, m.a)) * pc.scale;
+    imageStore(uOut, p, vec4(clamp(r, 0.0, pc.maxValue), 0.0, 0.0, 0.0));
+}

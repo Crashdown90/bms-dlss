@@ -1,0 +1,31 @@
+// bms-dlss: hloubka pro DLSS ([dlaa] DepthMode 1 a 2, Alt+F5) - pokus kvuli chveni pletiva s presety L/M.
+//
+// Hypoteza: s jitterem se hloubka pixelu na alfa-testovanem pletivu kazdy snimek prepina mezi dratem
+// (par metru) a vzdalenym pozadim; L/M to mohou brat jako disokluzi. Tento pruchod zapise do R32F:
+//   mode 1: minimum hardwarove hloubky v okoli 3x3 (nejblizsi povrch; D3D9 neinvertovana, 0 = near,
+//           1 = far), na okrajich obrazu se souradnice orezavaji (clamp),
+//   mode 2: diagnostika - vsude 1.0 (far).
+// Motion vektory (mv.comp) dal ctou puvodni hloubku.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D uDepth;              // DEPTH_IN, aspekt hloubky
+layout(binding = 7, r32f) uniform writeonly image2D uOut;  // hloubka pro DLSS
+
+layout(push_constant) uniform Push {
+    uint mode;  // 1 = min 3x3, 2 = konstanta 1.0
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uOut);
+    if (p.x >= size.x || p.y >= size.y) return;
+    float d = 1.0;
+    if (pc.mode == 1u) {
+        ivec2 hi = size - 1;
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) d = min(d, texelFetch(uDepth, clamp(p + ivec2(x, y), ivec2(0), hi), 0).r);
+    }
+    imageStore(uOut, p, vec4(d, 0.0, 0.0, 0.0));
+}

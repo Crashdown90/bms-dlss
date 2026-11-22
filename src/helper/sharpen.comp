@@ -1,0 +1,85 @@
+// bms-dlss: doostreni po DLSS - RCAS (Robust Contrast Adaptive Sharpening) z AMD FidelityFX FSR 1.
+// Vlastni prepis algoritmu z ffx_fsr1.h do GLSL (vcetne potlaceni sumu, FSR_RCAS_DENOISE).
+// Zaroven vraci alfu ze vstupu sceny (alfa vystupu DLSS je nesmysl, Guide 3.16). V casti B (od verze 10) je vstup
+// sub-rect COLOR_IN a vystup cely obraz: alfa z texelu pod stredem vystupniho pixelu (alphaScale, viz alpha.comp).
+//
+// Puvodni licence algoritmu (MIT):
+//
+// Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 1) uniform sampler2D uColor;                // COLOR_IN (jen alfa)
+layout(binding = 3, rgba8) uniform readonly image2D uOut;    // vystup DLSS
+layout(binding = 4, rgba8) uniform writeonly image2D uSharp; // doostreny vystup
+
+layout(push_constant) uniform Push {
+    float con;        // exp2(-stops): 1 = nejostrejsi, 0.25 = slabe (FSR 2 mapuje sharpness s na stops = 2 - 2s)
+    vec2 alphaScale;  // offset 8: velikost vstupu (COLOR_IN) / velikost vystupu po osach (1 = stejna mrizka)
+} pc;
+
+// Maximalni zaporny lalok filtru (FSR_RCAS_LIMIT)
+const float kLimit = 0.25 - 1.0 / 16.0;
+
+vec3 Load(ivec2 p, ivec2 size) { return imageLoad(uOut, clamp(p, ivec2(0), size - 1)).rgb; }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uOut);
+    if (p.x >= size.x || p.y >= size.y) return;
+
+    //    b
+    //  d e f
+    //    h
+    vec3 b = Load(p + ivec2(0, -1), size);
+    vec3 d = Load(p + ivec2(-1, 0), size);
+    vec3 e = Load(p, size);
+    vec3 f = Load(p + ivec2(1, 0), size);
+    vec3 h = Load(p + ivec2(0, 1), size);
+
+    // Potlaceni sumu: jas x2, odchylka stredu od okoli vztazena k rozsahu jasu.
+    float bL = b.b * 0.5 + (b.r * 0.5 + b.g);
+    float dL = d.b * 0.5 + (d.r * 0.5 + d.g);
+    float eL = e.b * 0.5 + (e.r * 0.5 + e.g);
+    float fL = f.b * 0.5 + (f.r * 0.5 + f.g);
+    float hL = h.b * 0.5 + (h.r * 0.5 + h.g);
+    float nz = 0.25 * (bL + dL + fL + hL) - eL;
+    float range = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);
+    nz = range > 0.0 ? clamp(abs(nz) / range, 0.0, 1.0) : 0.0;
+    nz = -0.5 * nz + 1.0;
+
+    // Min a max kruhu kolem stredu, z nich nejvetsi lalok, ktery jeste neprestreli rozsah 0..1.
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+    // Kanal, ktery je v celem kruhu 0 (resp. 1), nemuze podstrelit (prestrelit) - v AMD vyjde 0*inf = NaN a max()
+    // ho zahodi, tedy kanal lalok neomezuje. Totez explicitne (GLSL max s NaN je nedefinovany); stary clamp na
+    // 1e-5 tu daval 0 a vypinal doostreni pixelu se saturovanym kanalem.
+    vec3 hitMin = mix(vec3(1e30), min(mn4, e) / max(4.0 * mx4, vec3(1e-30)), greaterThan(mx4, vec3(0.0)));
+    vec3 hitMax = mix(vec3(-1e30), (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1e-30)), lessThan(mn4, vec3(1.0)));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-kLimit, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.con;
+    lobe *= nz;
+
+    // Vysledek: vazeny prumer stredu a kruhu (zaporne vahy = doostreni)
+    vec3 c = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+    imageStore(uSharp, p, vec4(clamp(c, 0.0, 1.0), texelFetch(uColor, ivec2((vec2(p) + 0.5) * pc.alphaScale), 0).a));
+}

@@ -1,0 +1,42 @@
+// bms-dlss: maska UI pro DLSS-G ([fg] DlssgUiAlpha, pokus v25u). DLSS-G s UIR (User Interface Recomposition) chce
+// krome snimku bez HUD i alfu UI: backbuffer = ui + (1 - alfa) * hudless. Hra UI zvlast nekresli, takze alfa se
+// odhadne z rozdilu hotoveho snimku (s HUD a ukazatelem modu) a snimku bez HUD: kde se lisi (s okrajem 1 px kvuli
+// vyhlazenym hranam pisma), alfa 1 = pixel patri UI a DLSS-G ho do generovanych snimku slozi beze zmeny; jinde 0.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D uFinal;    // backbuffer hry (s HUD)
+layout(binding = 1) uniform sampler2D uHudless;  // snimek bez HUD
+layout(binding = 2, r8) uniform writeonly image2D uAlpha;
+layout(binding = 3) uniform sampler2D uDepth;    // snapshot hloubky FG (velikost renderu), v25w: zbran v ruce
+
+layout(push_constant) uniform Push {
+    float thr;  // prah rozdilu (0..1), napr. 3/255
+    float vm;   // > 0: pixely s hloubkou <= vm (zbran / ruce, viewport Z 0..0.1) take do masky; 0 = vypnuto
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(uFinal, 0);
+    if (p.x >= size.x || p.y >= size.y) return;
+    float d = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+            vec3 a = texelFetch(uFinal, q, 0).rgb, b = texelFetch(uHudless, q, 0).rgb;
+            vec3 e = abs(a - b);
+            d = max(d, max(e.r, max(e.g, e.b)));
+        }
+    bool ui = d > pc.thr;
+    if (!ui && pc.vm > 0.0) {  // zbran: okoli 3x3 v hloubce (okraj 1 px)
+        ivec2 ds = textureSize(uDepth, 0);
+        ivec2 c = ivec2((vec2(p) + 0.5) * vec2(ds) / vec2(size));
+        for (int y = -1; y <= 1 && !ui; ++y)
+            for (int x = -1; x <= 1 && !ui; ++x) {
+                float z = texelFetch(uDepth, clamp(c + ivec2(x, y), ivec2(0), ds - 1), 0).r;
+                ui = z > 0.0 && z <= pc.vm;
+            }
+    }
+    imageStore(uAlpha, p, vec4(ui ? 1.0 : 0.0));
+}

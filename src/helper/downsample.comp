@@ -1,0 +1,193 @@
+// bms-dlss: zmenseni vystupu DLSS zpet na finalni rozliseni ([upscale] OutputScale > 1, supersampling misto DLDSR).
+//
+// DLSS dostane vstup W x H a vytvori obraz round(W*S) x round(H*S) (S = 4/3, 1.5, 2, 3). Tento pruchod ho zmensi
+// zpet na W x H separovatelnym filtrem roztazenym podle pomeru: jadro ma polomer 2 vystupni pixely, tedy 2*S
+// pixelu zdroje (4*S + 1 tapu na osu, pri S = 3 nejvic 13).
+//   kernel 0 = Lanczos-2 (vychozi), 1 = Catmull-Rom, 2 = Mitchell-Netravali B = C = 1/3 (bez prekmitu, mekci),
+//   3 = plosny box: vaha = presny prekryv texelu se stopou vystupniho pixelu (S x S texelu zdroje), i pro necele S.
+// Box jen pro porovnani (Alt+F1): nad novym Nyquistem propousti az ~0.6 a pletivo muze znovu vyrobit moire, ktere ma
+// supersampling odstranit; nema ale zadny prekmit. Vahy jsou soucinem vah po osach w(dx) * w(dy). Jeden pruchod bez mezivysledku
+// v pameti: skupina 8x8 vystupnich pixelu nacte svou dlazdici zdroje (11*S + 2 texelu na osu) jednou do sdilene
+// pameti (prevod do prostoru filtrace jednou na texel), pak filtruje separovatelne - vodorovne pro kazdy radek
+// dlazdice, svisle pro vystup (8 + 8 misto 64 tapu z pameti na pixel pri S = 2).
+// Lanczos a Catmull-Rom maji zaporne laloky: s doostrenim (RCAS po tomto pruchodu, flags bit 0) se vysledek orezava
+// na min/max texelu v "krabici" vystupniho pixelu (|d| <= S/2, aspon nejblizsi texel) - jako EASU ve FSR 1, jinak by
+// RCAS prekmit jeste zesilil (dvojite halo).
+// Prostor filtrace (flags bit 1): 0 = hodnoty sRGB (jako zmenseni hotoveho obrazu), 1 = linearni svetlo (tenke
+// svetle draty proti tmavemu pozadi vyjdou svetlejsi, tmave proti obloze tenci).
+// Alfa se vraci z COLOR_IN na finalni mrizce (alfa vystupu DLSS je nesmysl, Guide 3.16).
+//
+// Varianta HDR_IN (build.ps1 -> downsample_hdr_comp.h, [dlaa] InputMode 1, 2 a 3): zdroj je linearni RGBA16F vystup
+// DLSS. Prevod zpet (inverze inverzniho tone mappingu z linearize.comp, k = pc.k, a EOTF sRGB) se dela pro kazdy tap
+// uz tady, takze pri S > 1 neni potreba zvlastni pruchod velikosti vystupu DLSS (alpha.comp HDR_IN je jen pro S = 1).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 1) uniform sampler2D uColor;                // COLOR_IN (jen alfa), finalni velikost
+#ifdef HDR_IN
+layout(binding = 6, rgba16f) uniform readonly image2D uSrc;  // vystup DLSS (linearni HDR), velikost vystupu DLSS
+#else
+layout(binding = 8, rgba8) uniform readonly image2D uSrc;    // vystup DLSS (sRGB RGBA8), velikost vystupu DLSS
+#endif
+layout(binding = 3, rgba8) uniform writeonly image2D uOut;   // finalni obraz W x H (sRGB RGBA8), vstup RCAS a blitu
+
+layout(push_constant) uniform Push {
+    vec2 ratio;   // velikost zdroje / velikost vystupu po osach (= S, po zaokrouhleni rozmeru)
+    float k;      // HDR_IN: sila inverzniho tone mappingu (stejna jako v linearize.comp), 0 = vypnuto
+    uint flags;   // bit 0: orezat prekmit na min/max krabice, bit 1: filtrovat v linearnim svetle
+    uint kernel;  // 0 Lanczos-2, 1 Catmull-Rom, 2 Mitchell, 3 plosny box
+} pc;
+
+const int kTile = 8;      // vystupni pixely skupiny na osu (= local_size)
+const int kMaxTaps = 16;  // 4*S + 1 tapu na osu, S <= 3 -> 13
+// Texely zdroje dlazdice na osu: 7*S + 4*S + 2 (S = 3 -> 35, S = 2 -> 24). Velikost sdilene pameti urcuje, kolik
+// skupin bezi na SM naraz (obsazenost skryva latenci cteni obrazu): proto dve varianty - build.ps1 preklada i
+// MAX_SRC=26 (S <= 2.18, cca 10 KB misto 17 KB, pri S = 1.5 asi o 30 % rychlejsi) a helper vybira podle pomeru.
+#ifndef MAX_SRC
+#define MAX_SRC 36
+#endif
+const int kMaxSrc = MAX_SRC;
+const float kPi = 3.14159265358979;
+const vec3 kLumW = vec3(0.2126, 0.7152, 0.0722);  // Rec. 709
+
+// Jadro v jednotkach vystupnich pixelu, nosic (-2, 2)
+float Kernel(float x) {
+    x = abs(x);
+    if (x >= 2.0) return 0.0;
+    if (pc.kernel == 0u) {
+        // Lanczos-2: sinc(x) * sinc(x / 2) = 2 sin(pi x) sin(pi x / 2) / (pi x)^2
+        if (x < 1e-4) return 1.0;
+        float a = kPi * x;
+        return 2.0 * sin(a) * sin(0.5 * a) / (a * a);
+    }
+    // kubicky Mitchell-Netravali (B, C): Catmull-Rom = (0, 1/2), Mitchell = (1/3, 1/3)
+    float B = pc.kernel == 1u ? 0.0 : 1.0 / 3.0;
+    float C = pc.kernel == 1u ? 0.5 : 1.0 / 3.0;
+    float x2 = x * x, x3 = x2 * x;
+    if (x < 1.0) return ((12.0 - 9.0 * B - 6.0 * C) * x3 + (-18.0 + 12.0 * B + 6.0 * C) * x2 + (6.0 - 2.0 * B)) / 6.0;
+    return ((-B - 6.0 * C) * x3 + (6.0 * B + 30.0 * C) * x2 + (-12.0 * B - 48.0 * C) * x + (8.0 * B + 24.0 * C)) / 6.0;
+}
+
+vec3 SrgbToLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+}
+
+// zaporne a NaN -> 0, nad 1 -> 1 (vysledek jde do LDR obrazu sceny)
+vec3 Saturate(vec3 l) { return mix(vec3(0.0), min(l, vec3(1.0)), greaterThan(l, vec3(0.0))); }
+
+vec3 LinearToSrgb(vec3 l) {
+    l = Saturate(l);
+    return mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, greaterThan(l, vec3(0.0031308)));
+}
+
+// Hodnota tapu v prostoru filtrace (sRGB nebo linearni, vzdy 0..1)
+vec3 Tap(ivec2 q) {
+#ifdef HDR_IN
+    // stejne jako alpha.comp HDR_IN: zaporne a NaN -> 0, +inf -> max. RGBA16F, pak inverze rozsireni
+    vec3 h = imageLoad(uSrc, q).rgb;
+    h = mix(vec3(0.0), min(h, vec3(65504.0)), greaterThan(h, vec3(0.0)));
+    vec3 l = h / (1.0 + dot(h, kLumW) * pc.k);
+    return (pc.flags & 2u) != 0u ? Saturate(l) : LinearToSrgb(l);
+#else
+    vec3 c = imageLoad(uSrc, q).rgb;
+    return (pc.flags & 2u) != 0u ? SrgbToLinear(c) : c;
+#endif
+}
+
+// Sdilena pamet v FP16 (RGB ve dvou uint): polovicni velikost = vic skupin na SM (obsazenost skryva latenci
+// cteni obrazu); presnost 11 bitu staci pro 8bitovy vystup.
+shared uvec2 sTex[kMaxSrc][kMaxSrc];  // zdroj dlazdice v prostoru filtrace
+shared uvec2 sRow[kMaxSrc][kTile];    // po vodorovnem filtru: radek zdroje x vystupni sloupec
+shared uvec2 sRowMin[kMaxSrc][kTile], sRowMax[kMaxSrc][kTile];  // min/max krabice v radku (orezani prekmitu)
+
+uvec2 Pack(vec3 v) { return uvec2(packHalf2x16(v.rg), packHalf2x16(vec2(v.b, 0.0))); }
+vec3 Unpack(uvec2 u) { return vec3(unpackHalf2x16(u.x), unpackHalf2x16(u.y).x); }
+shared float sW[2][kTile][kMaxTaps]; // normalizovane vahy: [0] sloupce, [1] radky dlazdice
+shared uint sBox[2][kTile];          // bit i = tap i lezi v krabici vystupniho pixelu
+shared int sJ0[2][kTile];            // prvni tap relativne k pocatku dlazdice
+shared int sN[2][kTile];             // pocet tapu
+
+void main() {
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    int li = lid.y * kTile + lid.x;
+    ivec2 g0 = ivec2(gl_WorkGroupID.xy) * kTile;
+    ivec2 size = imageSize(uOut);
+    ivec2 hi = imageSize(uSrc) - 1;
+    vec2 r = pc.ratio;
+    // Zdroj dlazdice: od prvniho tapu prvniho pixelu po posledni tap posledniho (texel j ma stred j + 0.5,
+    // stred vystupniho pixelu p lezi v (p + 0.5) * S, nosic jadra je +-2 vystupni pixely = +-2*S)
+    ivec2 s0 = ivec2(ceil((vec2(g0) + 0.5) * r - 2.0 * r - 0.5));
+    ivec2 s1 = ivec2(floor((vec2(g0 + kTile - 1) + 0.5) * r + 2.0 * r - 0.5));
+    ivec2 ext = clamp(s1 - s0 + 1, ivec2(1), ivec2(kMaxSrc));
+
+    // Vahy: vlakna 0..7 pro sloupce, 8..15 pro radky dlazdice (normalizovane na soucet 1 po osach)
+    if (li < 2 * kTile) {
+        int axis = li / kTile, k = li % kTile;
+        float rr = r[axis];
+        float c = (float(g0[axis] + k) + 0.5) * rr;
+        int j0 = int(ceil(c - 2.0 * rr - 0.5));
+        int n = clamp(int(floor(c + 2.0 * rr - 0.5)) - j0 + 1, 1, kMaxTaps);
+        int jc = int(floor(c));  // nejblizsi texel (do krabice vzdy)
+        float w[kMaxTaps];
+        float sum = 0.0;
+        uint box = 0u;
+        for (int i = 0; i < n; ++i) {
+            float d = float(j0 + i) + 0.5 - c;
+            // box: prekryv texelu [d - 0.5, d + 0.5] se stopou [-S/2, S/2] (S >= 1 -> soucet > 0); taps mimo = 0
+            w[i] = pc.kernel == 3u ? max(0.0, min(d + 0.5, 0.5 * rr) - max(d - 0.5, -0.5 * rr)) : Kernel(d / rr);
+            sum += w[i];
+            if (abs(d) <= 0.5 * rr || j0 + i == jc) box |= 1u << uint(i);
+        }
+        for (int i = 0; i < kMaxTaps; ++i) sW[axis][k][i] = i < n ? w[i] / sum : 0.0;
+        sBox[axis][k] = box;
+        sJ0[axis][k] = j0 - s0[axis];
+        sN[axis][k] = min(n, kMaxSrc - (j0 - s0[axis]));  // pojistka (v mezich varianty se nic neusekne)
+    }
+    // Zdroj dlazdice do sdilene pameti; okraje obrazu: souradnice se orezavaji (clamp)
+    for (int i = li; i < ext.x * ext.y; i += kTile * kTile) {
+        ivec2 t = ivec2(i % ext.x, i / ext.x);
+        sTex[t.y][t.x] = Pack(Tap(clamp(s0 + t, ivec2(0), hi)));
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // Vodorovne: kazdy radek zdroje dlazdice x 8 vystupnich sloupcu
+    bool clampRing = (pc.flags & 1u) != 0u;
+    for (int i = li; i < ext.y * kTile; i += kTile * kTile) {
+        int y = i / kTile, ox = i % kTile;
+        int j0 = sJ0[0][ox], n = sN[0][ox];
+        uint box = sBox[0][ox];
+        vec3 acc = vec3(0.0), mn = vec3(1e30), mx = vec3(-1e30);
+        for (int k = 0; k < n; ++k) {
+            vec3 t = Unpack(sTex[y][j0 + k]);
+            acc += sW[0][ox][k] * t;
+            if ((box & (1u << uint(k))) != 0u) {
+                mn = min(mn, t);
+                mx = max(mx, t);
+            }
+        }
+        sRow[y][ox] = Pack(acc);
+        sRowMin[y][ox] = Pack(mn);
+        sRowMax[y][ox] = Pack(mx);
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // Svisle a zapis (az za posledni barierou smi vlakna mimo obraz skoncit)
+    ivec2 p = g0 + lid;
+    if (p.x >= size.x || p.y >= size.y) return;
+    int j0 = sJ0[1][lid.y], n = sN[1][lid.y];
+    uint box = sBox[1][lid.y];
+    vec3 v = vec3(0.0), mn = vec3(1e30), mx = vec3(-1e30);
+    for (int k = 0; k < n; ++k) {
+        v += sW[1][lid.y][k] * Unpack(sRow[j0 + k][lid.x]);
+        if ((box & (1u << uint(k))) != 0u) {
+            mn = min(mn, Unpack(sRowMin[j0 + k][lid.x]));
+            mx = max(mx, Unpack(sRowMax[j0 + k][lid.x]));
+        }
+    }
+    if (clampRing) v = clamp(v, mn, mx);
+    v = (pc.flags & 2u) != 0u ? LinearToSrgb(v) : Saturate(v);
+    imageStore(uOut, p, vec4(v, texelFetch(uColor, p, 0).a));
+}
