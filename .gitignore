@@ -16,7 +16,7 @@ dist/
 *.exp
 *.res
 
-# Testovaci a pomocne nastroje: publikuje se jen tools/release (bez lokalniho seznamu slov)
+# Testovaci a pomocne nastroje: publikuje se jen tools/release (bez lokalnich souboru)
 tools/*
 !tools/release/
 tools/release/local/

@@ -10,7 +10,7 @@
 #
 # Do zipu nikdy: docs\, PROGRESS.md, tools\, zalohy\, third_party\ (krome runtime DLL z build\), *.pdb, *.obj,
 # *.lib, *.exp, logy, zalohy *.vNN, *.original. Kontroluje podpisy DLL NVIDIA/AMD, release (ne dev) DLSS-G,
-# znacku proxy, architekturu, VERSIONINFO a zakazana slova. Vypise SHA256 zipu i vsech souboru (SHA256SUMS.txt).
+# znacku proxy, architekturu, VERSIONINFO a texty (volitelny lokalni seznam). Vypise SHA256 zipu i vsech souboru (SHA256SUMS.txt).
 #
 # Priklady:
 #   powershell -ExecutionPolicy Bypass -File tools\release\pack.ps1
@@ -90,7 +90,7 @@ if ((Test-Path $dev) -and (Get-FileHash $dev).Hash -eq (Get-FileHash (Join-Path 
 }
 foreach ($p in $proxy, $helper) {
     $vi = (Get-Item $p).VersionInfo
-    if ($vi.ProductName -ne 'bms-dlss') { Warn "$(Split-Path $p -Leaf) nema VERSIONINFO (src\res\*.rc, postup docs\priprava-vydani.md)." }
+    if ($vi.ProductName -ne 'bms-dlss') { Warn "$(Split-Path $p -Leaf) nema VERSIONINFO (src\res\*.rc)." }
     elseif ($vi.ProductVersion -ne $Version) { Warn "$(Split-Path $p -Leaf): ProductVersion $($vi.ProductVersion) <> $Version." }
     elseif ($vi.CompanyName -match '<autor>') { Warn "$(Split-Path $p -Leaf): CompanyName je zastupne <autor>." }
 }
@@ -167,8 +167,9 @@ try {
     }
     if ($bad) { throw "Zakazane soubory v balicku: $($bad -join ', ')" }
 
-    # ---- zakazana slova (texty + nase binarky; DLL NVIDIA/AMD se nekontroluji). Seznam je jen lokalne
-    #      (tools\release\local\, .gitignore): kazdy radek = regularni vyraz, radek "?" na zacatku = jen upozornit. ----
+    # ---- kontrola textu pred vydanim (texty + nase binarky; DLL NVIDIA/AMD se nekontroluji). Volitelny lokalni
+    #      seznam (tools\release\local\, neni v repozitari): kazdy radek = regularni vyraz, "?" na zacatku = jen
+    #      upozornit. Bez seznamu se kontrola preskoci (ani s -Release to neni chyba). ----
     $listFile = Join-Path $PSScriptRoot 'local\zakazana-slova.txt'
     $denyList = @(); $softList = @()
     if (Test-Path $listFile) {
@@ -177,7 +178,7 @@ try {
             if (-not $l -or $l.StartsWith('#')) { continue }
             if ($l.StartsWith('?')) { $softList += $l.Substring(1).Trim() } else { $denyList += $l }
         }
-    } else { Warn "Chybi $listFile - kontrola zakazanych slov preskocena." }
+    } else { Write-Host "Info: volitelny lokalni seznam $listFile neni - kontrola textu preskocena." }
     $deny = if ($denyList) { ($denyList | ForEach-Object { "(?:$_)" }) -join '|' } else { '(?!)' }
     $soft = if ($softList) { ($softList | ForEach-Object { "(?:$_)" }) -join '|' } else { '(?!)' }
     foreach ($rel in $files) {

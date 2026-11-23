@@ -210,8 +210,8 @@ void SetState(int32_t s) {
 }
 
 bool InitVk() {
-    HMODULE dll = LoadLibraryW(L"vulkan-1.dll");
-    if (!dll) return Fatal("vulkan-1.dll (64bit) nenalezeno"), false;
+    HMODULE dll = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);  // jen ze System32
+    if (!dll) return Fatal("vulkan-1.dll (64-bit) not found in System32"), false;
     vk.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetProcAddress(dll, "vkGetInstanceProcAddr");
     vk.vkCreateInstance = (PFN_vkCreateInstance)vk.vkGetInstanceProcAddr(nullptr, "vkCreateInstance");
     if (!vk.vkCreateInstance) return Fatal("vulkan-1.dll bez vkCreateInstance"), false;

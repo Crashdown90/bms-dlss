@@ -799,8 +799,9 @@ static std::vector<const char*> FilterExts(const std::vector<std::string>& want,
 }
 
 static bool InitVulkan() {
-    HMODULE dll = LoadLibraryW(L"vulkan-1.dll");
-    if (!dll) return Error("vulkan-1.dll (64bit) nenalezeno"), false;
+    // Jen ze System32 (zavadec Vulkanu instaluje ovladac GPU), ne ze slozky hry / helperu
+    HMODULE dll = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!dll) return Error("vulkan-1.dll (64-bit) not found in System32 - GPU driver without Vulkan?"), false;
     vk.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetProcAddress(dll, "vkGetInstanceProcAddr");
     vk.vkCreateInstance = (PFN_vkCreateInstance)vk.vkGetInstanceProcAddr(nullptr, "vkCreateInstance");
     vk.vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)vk.vkGetInstanceProcAddr(

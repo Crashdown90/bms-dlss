@@ -80,6 +80,8 @@ int Interop_ActiveUpscaler(const char** name);
 int Interop_DlssBroken();
 // Most se za behu vypnul chybou (jednou true, pak false): proxy ukaze OSD
 bool Interop_TakeFailNote();
+// Helper hlasi dlouhou praci hlavniho vlakna (helperBusyTick, nejvys 30 s) - limity prezentace pri tom stoji
+bool Interop_HelperBusy();
 // DXVK hry s neznamou verzi rozhrani interop: proxy ho pak nevola (most ani presenter FG)
 void Interop_BlockVk();
 bool Interop_VkBlocked();

@@ -1027,6 +1027,7 @@ static bool g_vkBlocked;
 void Interop_BlockVk() { g_vkBlocked = true; }
 bool Interop_VkBlocked() { return g_vkBlocked; }
 bool Interop_TakeFailNote() { return InterlockedExchange(&g_failNote, 0) != 0; }
+bool Interop_HelperBusy() { return HelperBusy(); }
 int Interop_DlssBroken() { return g_sh && !g_failed && g_sh->helperReady ? g_sh->helperDlssBroken : 0; }
 int Interop_GpuHint() { return g_gpuHint > 0 ? g_gpuHint : 0; }
 int Interop_FsrBroken() { return g_sh && !g_failed && g_sh->helperReady ? g_sh->helperFsrBroken : 0; }

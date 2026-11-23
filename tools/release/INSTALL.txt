@@ -17,7 +17,8 @@ Install
    (you get a "bms-dlss" folder next to bms.exe).
 3. Run bms-dlss\install.bat. It renames the game's DXVK d3d9.dll to d3d9_dxvk.dll
    (backup d3d9.dll.original), copies the mod next to it and adds the F4 key for the
-   upscaling mode (bms\cfg\bms_dlss_upscale.cfg + one line in autoexec.cfg).
+   experimental power saving mode (bms\cfg\bms_dlss_upscale.cfg + one line in
+   autoexec.cfg; a previous F4 binding is replaced and restored on uninstall).
 4. Start the game with the Steam launch option "Play DXVK". If Steam does not ask:
    Black Mesa > Properties > General > Launch options / "Selected launch option" > DXVK.
    With the default option ("Play Black Mesa") the game does not use DXVK and the mod
@@ -29,15 +30,21 @@ After a game update or "Verify integrity of game files"
   bms-dlss\install.bat again (your settings in bms_dlss.ini are kept).
 
 Uninstall
-- Close the game and run bms-dlss\uninstall.bat. It restores the original DXVK, removes
-  the DLSS / FSR libraries and the F4 line from autoexec.cfg. Alternatively: Steam >
-  Verify integrity of game files (leftover files of the mod are then unused).
+- Close the game and run bms-dlss\uninstall.bat. It restores the original DXVK (a newer
+  DXVK from a Steam update is left unchanged), removes the DLSS / FSR libraries and the
+  F4 line from autoexec.cfg. Settings, logs and d3d9.dll.original stay. Fallback: Steam >
+  Verify integrity of game files (then remove "exec bms_dlss_upscale" from autoexec.cfg).
+  If the image stays blurry, type mat_viewportscale 1 in the game console.
 
 Notes
 - bms_dlss_helper.exe and d3d9.dll are not code-signed. The menu uses a keyboard hook
   (only while the game runs). Some antivirus programs may warn about such files; the
   SHA256 checksums of all files are in SHA256SUMS.txt.
+- The mod does nothing? Start the game with the launch option "DXVK" and run install.bat
+  again after game updates. Logs: bms_dlss.log and bms_dlss_helper.log in
+  bin\thirdparty\dxvk-windows-x86 (attach both when reporting a bug).
 - Do not use the mod in multiplayer.
+- Source code: https://github.com/Crashdown90/bms-dlss
 - Licenses: LICENSE (MIT, mod code) and THIRD_PARTY_NOTICES.md (NVIDIA DLSS, AMD FSR,
   DXVK, Vulkan). Unofficial mod, not affiliated with Crowbar Collective, NVIDIA or AMD.
 
@@ -57,7 +64,8 @@ Instalace
    (vznikne slozka "bms-dlss" vedle bms.exe).
 3. Spust bms-dlss\install.bat. Prejmenuje d3d9.dll z DXVK hry na d3d9_dxvk.dll (zaloha
    d3d9.dll.original), zkopiruje vedle nej mod a prida klavesu F4 pro usporny rezim
-   (bms\cfg\bms_dlss_upscale.cfg + jeden radek v autoexec.cfg).
+   (bms\cfg\bms_dlss_upscale.cfg + jeden radek v autoexec.cfg; predchozi prirazeni F4
+   nahradi a odinstalace ho vrati).
 4. Hru spoustej volbou Steamu "Hrat DXVK" ("Play DXVK"). Kdyz se Steam nepta:
    Black Mesa > Vlastnosti > Obecne > Moznosti spusteni / "Zvolena moznost spusteni" > DXVK.
    Pri vychozi volbe ("Hrat Black Mesa") hra DXVK nepouzije a mod se vubec nenacte
@@ -69,14 +77,20 @@ Po aktualizaci hry nebo "Overit integritu souboru"
   bms-dlss\install.bat (nastaveni v bms_dlss.ini zustane).
 
 Odinstalace
-- Zavri hru a spust bms-dlss\uninstall.bat. Vrati puvodni DXVK, odebere knihovny DLSS /
-  FSR a radek F4 z autoexec.cfg. Jinak: Steam > Overit integritu souboru hry (zbyle
-  soubory modu se pak nepouzivaji).
+- Zavri hru a spust bms-dlss\uninstall.bat. Vrati puvodni DXVK (novejsi DXVK z aktualizace
+  Steamu necha), odebere knihovny DLSS / FSR a radek F4 z autoexec.cfg. Nastaveni, logy
+  a d3d9.dll.original zustanou. Nouzove: Steam > Overit integritu souboru hry (pak smaz
+  radek "exec bms_dlss_upscale" z autoexec.cfg). Kdyz zustane obraz rozmazany, zadej
+  v konzoli hry mat_viewportscale 1.
 
 Poznamky
 - bms_dlss_helper.exe a d3d9.dll nejsou digitalne podepsane. Menu pouziva hacek
   klavesnice (jen za behu hry). Nektere antiviry mohou varovat; kontrolni soucty SHA256
   vsech souboru jsou v SHA256SUMS.txt.
+- Mod nic nedela? Spoustej hru volbou "DXVK" a po aktualizaci hry spust znovu install.bat.
+  Logy: bms_dlss.log a bms_dlss_helper.log v bin\thirdparty\dxvk-windows-x86 (k hlaseni
+  chyby prilozit oba).
 - Mod nepouzivej v multiplayeru.
+- Zdrojovy kod: https://github.com/Crashdown90/bms-dlss
 - Licence: LICENSE (MIT, kod modu) a THIRD_PARTY_NOTICES.md (NVIDIA DLSS, AMD FSR, DXVK,
   Vulkan). Neoficialni mod, bez vztahu ke Crowbar Collective, NVIDIA a AMD.

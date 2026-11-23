@@ -34,8 +34,9 @@ int Present_FgGetMode();
 void Present_FgSetMode(int mode);
 // Prepinani FG je zive: cesta presenteru v hlavnim helperu existuje (zarizeni presmerovane) a neni v zaloze.
 bool Present_FgPresenterActive();
+bool Present_FgRetryable();  // zaloha z casoveho limitu startu: vyp / zap FG = novy pokus
 // Frame Generation presla za behu do zalohy (jednou true, pak false): proxy ukaze OSD
-bool Present_TakeFallbackNote();
+int Present_TakeFallbackNote();  // 0 = nic, 1 = FG selhala, 2 = jen casovy limit startu (jde znovu)
 // Bezpecny start: pred Present_LoadConfig - duvod (minule spusteni skoncilo chybou), "" = ne. SafeStartHit = FG
 // pro tento start vypnuta
 void Present_SetSafeStart(const char* why);

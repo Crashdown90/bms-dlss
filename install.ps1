@@ -1,13 +1,15 @@
 # Nainstaluje proxy d3d9.dll do Black Mesa (pouze pro volbu "Hrat DXVK").
 # Puvodni DXVK se zachova jako d3d9_dxvk.dll a zaloha d3d9.dll.original.
-param([string]$GameDir = "D:\steam\steamapps\common\Black Mesa")
+# Spousti ho install.bat z balicku (bms-dlss-setup.ps1 najde hru a preda -GameDir).
+param([string]$GameDir = '')
 $ErrorActionPreference = 'Stop'
+if (-not $GameDir) { throw 'Run bms-dlss\install.bat from the release package (or pass -GameDir "<Black Mesa folder>").' }
 $marker = 'BMS_DLSS_PROXY_MARKER_v1'
 $dst = Join-Path $GameDir 'bin\thirdparty\dxvk-windows-x86'
 $src = Join-Path $PSScriptRoot 'build\d3d9.dll'
 
 if (Get-Process bms -ErrorAction SilentlyContinue) { throw "Black Mesa is running - close the game first." }
-if (-not (Test-Path $src)) { throw "Missing $src - run build.ps1 first." }
+if (-not (Test-Path $src)) { throw "Missing $src - the package is incomplete, extract the whole zip again (developers: run build.ps1)." }
 if (-not (Test-Path "$dst\d3d9.dll")) { throw "Not found: $dst\d3d9.dll" }
 
 function IsProxy($f) { [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f)).Contains($marker) }
@@ -83,20 +85,33 @@ if (Test-Path $cfgDir) {
         $r = New-Object IO.StreamReader($ae, $enc, $true)
         try { $t = $r.ReadToEnd(); $enc = $r.CurrentEncoding } finally { $r.Close() }
     }
-    if ($t -notmatch '(?m)^[ \t]*exec[ \t]+bms_dlss_upscale\b') {
-        if ($t.Length -gt 0 -and -not $t.EndsWith("`n")) { $t += "`r`n" }
-        $t += "// bms-dlss: power saving mode (key F4); removed by uninstall.ps1`r`n$line`r`n"
-        [IO.File]::WriteAllText($ae, $t, $enc)
-        Write-Host "autoexec.cfg: added line '$line' (key F4: native -> Quality -> Balanced, experimental)."
-    }
-    # Upozornit, kdyz ma hrac na F4 vlastni bind (nas cfg ho prepise)
+    # Hrac mel na F4 vlastni prikaz (config.cfg): nas cfg ho prepise - upozornit a puvodni bind si zapamatovat
+    # v komentari autoexec.cfg; uninstall.ps1 ho vrati do config.cfg
+    $prevF4 = $null
     $cc = Join-Path $cfgDir 'config.cfg'
     if (Test-Path $cc) {
-        $b = Select-String -Path $cc -Pattern '^\s*bind\s+"F4"\s+"([^"]*)"' | Select-Object -First 1
+        $b = Select-String -Path $cc -Encoding UTF8 -Pattern '^\s*bind\s+"F4"\s+"([^"]*)"' | Select-Object -First 1
         if ($b -and $b.Matches[0].Groups[1].Value -ne 'dlss_vp') {
-            Write-Host "WARNING: F4 was bound to '$($b.Matches[0].Groups[1].Value)' - it is now bound to dlss_vp (power saving mode)."
+            $prevF4 = 'bind "F4" "' + $b.Matches[0].Groups[1].Value + '"'
+            Write-Host "WARNING: F4 was bound to '$($b.Matches[0].Groups[1].Value)' - it is now bound to the power saving mode (uninstall restores it)."
         }
     }
+    $changed = $false
+    # Znovu po odinstalaci: radek "mat_viewportscale 1" z uninstall.ps1 uz neni potreba (cfg modu vraci nativni render)
+    $n = $t -replace '(?m)^// bms-dlss uninstalled:.*\r?\n(mat_viewportscale 1\r?\n)?', ''
+    if ($n -ne $t) { $t = $n; $changed = $true }
+    if ($t -notmatch '(?m)^[ \t]*exec[ \t]+bms_dlss_upscale\b') {
+        if ($t.Length -gt 0 -and -not $t.EndsWith("`n")) { $t += "`r`n" }
+        $t += "// bms-dlss: power saving mode (key F4); removed by uninstall.bat`r`n$line`r`n"
+        $changed = $true
+        Write-Host "autoexec.cfg: added line '$line' (key F4: native -> Quality -> Balanced, experimental)."
+    }
+    if ($prevF4 -and $t -notmatch '(?m)^// bms-dlss: previous F4 binding:') {
+        if (-not $t.EndsWith("`n")) { $t += "`r`n" }
+        $t += "// bms-dlss: previous F4 binding: $prevF4`r`n"
+        $changed = $true
+    }
+    if ($changed) { [IO.File]::WriteAllText($ae, $t, $enc) }
 } else {
     Write-Host "WARNING: $cfgDir not found - the F4 power saving mode is not set up."
 }

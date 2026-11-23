@@ -87,11 +87,12 @@ New-Item -ItemType Directory -Force (Join-Path $root 'build\x64') | Out-Null
 # Adaptivni FSR FG (fork FSR 3.1.4 s casem t, MIT) -> build\x64\afg.lib (preklada se jen pri zmene src\helper\afg)
 & (Join-Path $root 'src\helper\afg\build_afg.ps1')
 if (-not (Test-Path (Join-Path $root 'build\x64\afg.lib'))) { throw "Chybi build\x64\afg.lib (src\helper\afg\build_afg.ps1)." }
+# /DEPENDENTLOADFLAG:0x800 = staticke importy helperu (version, wintrust, crypt32 ...) jen ze System32
 $cmd = "call `"$vcvars`" x64 >nul && cd /d `"$root`" && " +
        "rc /nologo /fo build\x64\helper.res src\res\helper.rc && " +
        "cl /nologo /O2 /Zi /MT /EHsc /std:c++17 /W3 /Fdbuild\x64\helper_cl.pdb /I`"$vkInc`" /I`"$dlss\include`" /I`"$gen`" /I`"$ffx`" " +
        "src\helper\helper.cpp src\helper\present.cpp build\x64\helper.res /Fobuild\x64\ /Febuild\bms_dlss_helper.exe " +
-       "/link /DEBUG /OPT:REF /OPT:ICF /PDB:build\bms_dlss_helper.pdb /PDBALTPATH:bms_dlss_helper.pdb /SUBSYSTEM:WINDOWS /MACHINE:X64 /LIBPATH:`"$dlss\lib\Windows_x86_64\x64`" " +
+       "/link /DEBUG /OPT:REF /OPT:ICF /PDB:build\bms_dlss_helper.pdb /PDBALTPATH:bms_dlss_helper.pdb /SUBSYSTEM:WINDOWS /MACHINE:X64 /DEPENDENTLOADFLAG:0x800 /LIBPATH:`"$dlss\lib\Windows_x86_64\x64`" " +
        "nvsdk_ngx_s.lib user32.lib advapi32.lib wintrust.lib crypt32.lib version.lib build\x64\afg.lib"
 cmd /c $cmd
 if ($LASTEXITCODE -ne 0) { throw "Preklad helperu selhal (kod $LASTEXITCODE)." }

@@ -21,7 +21,7 @@ repository. Place the following folders next to `src\`:
 
 | folder | what | where to get it |
 |---|---|---|
-| `third_party\DLSS` | NVIDIA DLSS SDK 310.x (headers `include\`, `lib\Windows_x86_64\x64\nvsdk_ngx_s.lib`, release DLLs in `lib\Windows_x86_64\rel\`) | https://github.com/NVIDIA/DLSS |
+| `third_party\DLSS` | NVIDIA DLSS SDK 310.x, the release uses the 310.9.16 DLLs (headers `include\`, `lib\Windows_x86_64\x64\nvsdk_ngx_s.lib`, release DLLs in `lib\Windows_x86_64\rel\`) | https://github.com/NVIDIA/DLSS |
 | `third_party\FidelityFX-SDK` | AMD FSR SDK 2.4.0 (`Kits\FidelityFX` – ffx API headers and the signed DLLs) | https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK |
 | `third_party\Vulkan-Headers` | Vulkan headers (tested with 1.4.368) | https://github.com/KhronosGroup/Vulkan-Headers |
 | `third_party\glslang\bin\glslang.exe` | glslang shader compiler (tested with 16.x) | https://github.com/KhronosGroup/glslang/releases |
@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "<path to Black Me
 ```
 
 Start the game with the Steam launch option "Play DXVK". `uninstall.ps1 -GameDir "<path>"` restores the original
-DXVK. Settings are in `bin\thirdparty\dxvk-windows-x86\bms_dlss.ini` (the template `bms_dlss.ini` documents every key),
+DXVK. Settings are in `bin\thirdparty\dxvk-windows-x86\bms_dlss.ini` (the template `bms_dlss.ini` documents the player-facing keys),
 logs are `bms_dlss.log` (proxy) and `bms_dlss_helper.log` (helper) in the same folder.
 
 ## Release package
@@ -63,6 +63,9 @@ powershell -ExecutionPolicy Bypass -File tools\release\pack.ps1 -Release -Readme
 ```
 
 creates `dist\bms-dlss-<version>.zip` with `SHA256SUMS.txt`. The version is taken from `src\res\version.h`.
+
+The build is not bit-for-bit reproducible (PE timestamps). The third-party DLLs in the release are the unmodified
+signed files from the SDKs - compare their SHA256 with `SHA256SUMS.txt` in the release zip.
 
 ## Licenses
 

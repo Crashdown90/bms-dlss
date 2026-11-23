@@ -1320,11 +1320,13 @@ static void SetFgMode(int id, Src src) {
     Log("frame generation: %s%s%s",
         id == FG_DLSSG ? "DLSS-G 2x" : id == FG_FSR2X ? "FSR" : id == FG_FSR_ADAPTIVE ? "FSR adaptivni" : "vypnuto",
         SrcTag(src),
-        id != FG_OFF && !Present_FgPresenterActive() ? " - plati az po restartu hry (za behu nejde, viz log prezentace)"
-                                                     : "");
+        id != FG_OFF && !Present_FgPresenterActive() && !Present_FgRetryable()
+            ? " - plati az po restartu hry (za behu nejde, viz log prezentace)"
+            : "");
 }
 static StrId FgModeNote() {
-    return Present_FgGetMode() != BMSD_FG_OFF && !Present_FgPresenterActive() ? S_NOTE_RESTART : S_NONE;
+    return Present_FgGetMode() != BMSD_FG_OFF && !Present_FgPresenterActive() && !Present_FgRetryable() ? S_NOTE_RESTART
+                                                                                                       : S_NONE;
 }
 // Nasobek ([fg] Multiplier=auto|2..6): zobrazene snimky na jeden skutecny (5x a 6x od v25j, auto = FgAutoMult). FSR 2x umi jen 2x; DLSS-G podle GPU (helper hlasi
 // NGX MultiFrameCountMax: RTX 50 4x, RTX 40 2x). Volby nad moznosti rezimu jsou sede (pri listovani se preskakuji),
@@ -1644,7 +1646,7 @@ static void MenuSetOverlayVersions(int id, Src s) {
     Log("menu: radek s verzemi %s%s", id ? "zapnuto" : "vypnuto", SrcTag(s));
 }
 // Hlaseni chyby: logy (i minuleho spusteni a uschovane logy padu), ini a dxvk.conf do slozky
-// bms_dlss_hlaseni_<datum_cas> vedle logu. Kopiruje vlastni vlakno (ne vlakno hry); vysledek OSD.
+// bms_dlss_report_<datum_cas> vedle logu. Kopiruje vlastni vlakno (ne vlakno hry); vysledek OSD.
 static wchar_t g_reportName[64];
 static DWORD WINAPI MenuReportThread(LPVOID) {
     const std::wstring dir = std::wstring(g_dir) + L"\\" + g_reportName;
@@ -1671,7 +1673,7 @@ static void MenuReportAction() {
     MenuClose("hlaseni chyby");
     SYSTEMTIME st;
     GetLocalTime(&st);
-    swprintf(g_reportName, 64, L"bms_dlss_hlaseni_%04u%02u%02u_%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour,
+    swprintf(g_reportName, 64, L"bms_dlss_report_%04u%02u%02u_%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour,
              st.wMinute, st.wSecond);
     Log("menu: ukladam hlaseni chyby do %ls", g_reportName);
     if (HANDLE t = CreateThread(nullptr, 0, MenuReportThread, nullptr, 0, nullptr)) CloseHandle(t);
@@ -1778,7 +1780,7 @@ static const MenuSection kMenuSections[] = {
     {S_SEC_FG, kItemsFg, MENU_N(kItemsFg), nullptr, PAGE_COMMON},
     {S_SEC_PERF, kItemsPerf, MENU_N(kItemsPerf), nullptr, PAGE_COMMON},
     {S_SEC_DLSS, kItemsDlss, MENU_N(kItemsDlss), nullptr, PAGE_ADVANCED},
-    {S_SEC_DEBUG, kItemsDebug, MENU_N(kItemsDebug), nullptr, PAGE_ADVANCED},
+    {S_SEC_DEBUG, kItemsDebug, MENU_N(kItemsDebug), []() { return g_cfg.debugKeys; }, PAGE_ADVANCED},  // jen [keys] DebugKeys=1
     {S_SEC_MENU, kItemsMenu, MENU_N(kItemsMenu), nullptr, PAGE_ADVANCED},
     {S_SEC_KEYS, kItemsKeys, MENU_N(kItemsKeys), nullptr, PAGE_ADVANCED},
 };
@@ -2376,7 +2378,7 @@ static bool g_testFgKeyWas, g_testUpsKeyWas;
 static void MenuTestKeysFrame(bool modKey) {
     const bool on = g_testKeysOn.load(std::memory_order_relaxed);
     if (KeyEdge(on && modKey && KeyDown(kTestKeyFg), g_testFgKeyWas)) {
-        if (!Present_FgPresenterActive()) {
+        if (!Present_FgPresenterActive() && !Present_FgRetryable()) {
             Log("zkratka Alt+F9: Frame Generation za behu nejde (zarizeni hry nepresmerovano nebo zaloha prezentace), "
                 "vyzaduje restart");
             SrcBeep(Src::KEY, MB_ICONHAND);
@@ -2882,7 +2884,7 @@ static void MenuBuild(OvList& L, UINT bbW, UINT bbH, int px) {
         const int ty = textY(y, mt.titleH, fTitle);
         int x = OvText(L, OVF_TITLE, inL, ty, Tr(S_TITLE), C.text);
         wchar_t ver[48];
-        swprintf(ver, 48, L"bms-dlss %d", BMSD_VERSION);
+        swprintf(ver, 48, L"bms-dlss %hs", BMSDLSS_VER_STR);  // verze vydani (BMSD_VERSION je verze rozhrani)
         OvText(L, OVF_REG, x + px * 3 / 4, ty + fTitle.ascent - fReg.ascent, ver, C.dim);
         std::wstring mk = g_cfg.modifier == VK_MENU ? L"Alt+" : g_cfg.modifier == VK_SHIFT ? L"Shift+"
                           : g_cfg.modifier == 0 ? L"Alt+" : L"Ctrl+";
@@ -3085,7 +3087,7 @@ static void OsdBuild(OvList& L, UINT w, UINT h, int px, float alpha) {
     bool warn = false;
     if (g_osd.what == OSD_FAIL_FG || g_osd.what == OSD_FAIL_BRIDGE || g_osd.what == OSD_SAFESTART ||
         g_osd.what == OSD_DXVK) {
-        text = std::wstring(Tr(g_osd.what == OSD_FAIL_FG       ? S_OSD_FAIL_FG
+        text = std::wstring(Tr(g_osd.what == OSD_FAIL_FG       ? (g_osdFgRetry ? S_OSD_FAIL_FG_RETRY : S_OSD_FAIL_FG)
                                : g_osd.what == OSD_FAIL_BRIDGE ? S_OSD_FAIL_BRIDGE
                                : g_osd.what == OSD_SAFESTART   ? S_OSD_SAFESTART
                                                                : S_OSD_DXVK));

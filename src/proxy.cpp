@@ -1777,6 +1777,7 @@ enum OsdWhat {
 };
 static void OsdNotify(int what);  // src\menu.inl
 static wchar_t g_osdRender[96];   // text OSD_RENDER
+static bool g_osdFgRetry;         // OSD_FAIL_FG: jen casovy limit startu - FG jde zkusit znovu (vyp / zap v menu)
 static inline void SrcNotify(Src src, int what) {
     if (src == Src::KEY) OsdNotify(what);
 }
@@ -2363,7 +2364,10 @@ static void MsaaFrameEnd() {
 static bool g_dxvkWarn;  // OSD: DXVK chybi nebo ma neznamou verzi (DllMain)
 // Chyby za behu: jednou OSD (6 s), aby hrac vedel, proc se zmenil obraz / plynulost a ze se to do restartu nevrati
 static void FailNotesFrameEnd() {
-    if (Present_TakeFallbackNote()) OsdNotify(OSD_FAIL_FG);
+    if (const int fb = Present_TakeFallbackNote()) {
+        g_osdFgRetry = fb == 2;
+        OsdNotify(OSD_FAIL_FG);
+    }
     if (Interop_TakeFailNote()) OsdNotify(OSD_FAIL_BRIDGE);
     if (const int r = g_reportDone.exchange(0)) OsdNotify(r);
     // Upozorneni pri startu: az po nacteni okna hry (~300 snimku), DXVK pred bezpecnym startem
@@ -5058,8 +5062,23 @@ static bool PrevLogFailure(const std::wstring& path, char* why, size_t n) {
     size_t r;
     while ((r = fread(buf, 1, sizeof buf, f)) > 0 && t.size() < (16u << 20)) t.append(buf, r);
     fclose(f);
-    if (t.find("DEVICE_LOST") != std::string::npos) snprintf(why, n, "ztrata zarizeni GPU (DEVICE_LOST)");
-    else if (t.find("PAD: neosetrena") != std::string::npos) snprintf(why, n, "pad procesu hry");
+    // Po radcich: radky, ktere jen opakuji duvod z jeste starsiho logu (bezpecny start), se nepocitaji - jinak by se
+    // jedna chyba hledala znovu v kazdem dalsim logu a bezpecny start by se spoustel donekonecna. Hleda se presna
+    // znacka chyby Vulkanu a radek padu z vlastniho filtru (ne kod ukonceni helperu "PAD: neosetrena vyjimka C++").
+    bool lost = false, crash = false;
+    size_t pos = 0;
+    while (pos < t.size() && !lost) {
+        size_t e = t.find('\n', pos);
+        if (e == std::string::npos) e = t.size();
+        const std::string line = t.substr(pos, e - pos);
+        pos = e + 1;
+        if (line.find("minule spusteni") != std::string::npos || line.find("previous run") != std::string::npos)
+            continue;
+        if (line.find("VK_ERROR_DEVICE_LOST") != std::string::npos) lost = true;
+        else if (line.find("PAD: neosetrena vyjimka 0x") != std::string::npos) crash = true;
+    }
+    if (lost) snprintf(why, n, "GPU device lost");
+    else if (crash) snprintf(why, n, "game process crashed");
     return why[0] != 0;
 }
 
@@ -5142,9 +5161,9 @@ static void LogHeader() {
     }
     SYSTEM_POWER_STATUS ps = {};
     const bool pwr = GetSystemPowerStatus(&ps) != 0;
-    Log("bms-dlss %s (rozhrani %d, sestaveno %s %s), spusteno %04u-%02u-%02u, Windows %lu.%lu build %lu, napajeni %s",
+    Log("bms-dlss %s (interface %d, built %s %s), started %04u-%02u-%02u, Windows %lu.%lu build %lu, power %s",
         BMSDLSS_VER_STR, BMSD_VERSION, __DATE__, __TIME__, st.wYear, st.wMonth, st.wDay, major, minor, build,
-        !pwr ? "?" : ps.ACLineStatus == 1 ? "sit" : ps.ACLineStatus == 0 ? "BATERIE" : "?");
+        !pwr ? "?" : ps.ACLineStatus == 1 ? "AC" : ps.ACLineStatus == 0 ? "BATTERY" : "?");
 }
 
 // ---------------------------------------------------------------------------
@@ -5163,7 +5182,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         g_log = _wfopen(logPath.c_str(), L"w");
         Log("%s nacten, slozka: %ls", kMarker, g_dir);
         LogHeader();
-        if (prevFail) Log("minule spusteni skoncilo chybou: %s (log uschovan jako bms_dlss.crash-*.log)", prevWhy);
+        if (prevFail)
+            Log("WARNING: the previous run ended with an error: %s (log kept as bms_dlss.crash-*.log)", prevWhy);
         Present_SetSafeStart(prevFail ? prevWhy : "");
         CrashLogInstall(h);
         LoadConfig();
@@ -5210,10 +5230,10 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
             const std::string dv = DxvkVersion(real);
             const bool known = dv.size() > 2 && dv[1] == '3' && dv[2] == '.';
             const bool allow = GetPrivateProfileIntW(L"bridge", L"AllowUnknownDxvk", 0, IniPath().c_str()) != 0;
-            Log("DXVK: %s%s", dv.empty() ? "verze nezjistena" : dv.c_str(),
-                known ? "" : allow ? " - neznama verze, [bridge] AllowUnknownDxvk=1: pouzivam presto"
-                                   : " - neznama verze: most a Frame Generation vypnuty ([bridge] AllowUnknownDxvk=1 "
-                                     "zkusi presto)");
+            Log("DXVK: %s%s", dv.empty() ? "version unknown" : dv.c_str(),
+                known ? "" : allow ? " - WARNING: unknown version, [bridge] AllowUnknownDxvk=1: used anyway"
+                                   : " - WARNING: unknown version: DLSS / FSR and Frame Generation are off "
+                                     "([bridge] AllowUnknownDxvk=1 tries anyway)");
             if (!known && !allow && GetFileAttributesW(real.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 Interop_BlockVk();
                 g_dxvkWarn = true;
@@ -5224,8 +5244,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
             const std::string b = GameBuildId();
             bool kb = false;
             for (const char* x : kKnownBuilds) kb = kb || b == x;
-            Log("hra: Steam build %s%s", b.empty() ? "nezjisten" : b.c_str(),
-                b.empty() || kb ? "" : " - WARN: na tomto buildu mod neovereny (po aktualizaci hry zkontrolovat MV a kameru)");
+            Log("game: Steam build %s%s", b.empty() ? "unknown" : b.c_str(),
+                b.empty() || kb ? "" : " - WARN: mod not verified on this game build (a game update may affect it)");
         }
         g_real = LoadLibraryW(real.c_str());
         if (!g_real) {

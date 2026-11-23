@@ -17,7 +17,7 @@
     /* stavove radky */                                                                                              \
     X(S_ST_DLSS_OFF, L"DLSS / FSR vypnuto", L"DLSS / FSR off")                                                                   \
     X(S_ST_DLSS_WAIT, L"Upscaler se připravuje", L"Upscaler is starting")                                                    \
-    X(S_ST_DEBUG, L"ladicí režim mostu", L"bridge debug mode")                                                       \
+    X(S_ST_DEBUG, L"ladicí režim helperu", L"helper debug mode")                                                       \
     X(S_ST_PRESET, L"preset", L"preset")                                                                             \
     X(S_ST_DEFAULT, L"výchozí", L"default")                                                                          \
     X(S_ST_DEFAULT_K, L"výchozí (K)", L"default (K)")                                                                          \
@@ -47,9 +47,9 @@
     X(S_IT_DOWN, L"Filtr zmenšení", L"Downscale filter")                                                             \
     X(S_IT_MIPBIAS, L"Mip bias", L"Mip bias")                                                                        \
     X(S_IT_MIPBIAS_B, L"Mip bias (úsporný režim)", L"Mip bias (power saving)")                                       \
-    X(S_IT_OBJMV, L"MV pohyblivých objektů", L"Object motion vectors")                                               \
+    X(S_IT_OBJMV, L"Pohybové vektory objektů", L"Object motion vectors")                                               \
     X(S_IT_ECO, L"Render", L"Render")                                                                                \
-    X(S_IT_LIGHTSB, L"Opravy efektů (LightsB)", L"Effect fixes (LightsB)")                                           \
+    X(S_IT_LIGHTSB, L"Opravy efektů", L"Effect fixes")                                           \
     X(S_IT_FG_MODE, L"Režim", L"Mode")                                                                               \
     X(S_IT_FG_MULT, L"Násobek", L"Multiplier")                                                                       \
     X(S_IT_FG_TARGET, L"Výstup FPS (strop)", L"Output FPS cap")                                                      \
@@ -62,7 +62,7 @@
       L"On: no frame generation while this menu is open (no menu artifacts). Off: FG changes and frame counts "      \
       L"show immediately.")                                                                                          \
     X(S_IT_FG_STATE, L"Stav", L"Status")                                                                             \
-    X(S_IT_LATENCY, L"Snížení latence (≈ Reflex)", L"Latency reduction (≈ Reflex)")                                  \
+    X(S_IT_LATENCY, L"Snížení latence", L"Latency reduction")                                                      \
     X(S_IT_FPSCOUNTER, L"Ukazatel FPS", L"FPS counter")                                                              \
     X(S_IT_OVERLAYVER, L"Zobrazit verze", L"Show versions")                                                          \
     X(S_OV_FG_OFF, L"FG vyp", L"FG off")                                                                             \
@@ -70,10 +70,10 @@
     X(S_IT_INPUT, L"Vstup DLSS", L"DLSS input")                                                                      \
     X(S_IT_DEPTH, L"Hloubka pro DLSS", L"Depth for DLSS")                                                            \
     X(S_IT_PHASES, L"Fáze jitteru", L"Jitter phases")                                                                \
-    X(S_IT_PIPELINE, L"Synchronizace mostu", L"Bridge sync")                                                         \
+    X(S_IT_PIPELINE, L"Synchronizace helperu", L"Helper sync")                                                         \
     X(S_IT_JSIGN, L"Znaménko jitteru", L"Jitter sign")                                                               \
     X(S_IT_JITTER, L"Jitter bez DLSS", L"Jitter without DLSS")                                                       \
-    X(S_IT_BRIDGE, L"Režim mostu", L"Bridge mode")                                                                   \
+    X(S_IT_BRIDGE, L"Režim helperu", L"Helper mode")                                                                   \
     X(S_IT_CAPTURE, L"Záchyt snímků", L"Frame capture")                                                              \
     X(S_IT_RESETADV, L"Výchozí (doporučené)", L"Defaults (recommended)")                                             \
     X(S_IT_REPORT, L"Uložit hlášení chyby", L"Save a bug report")                                                     \
@@ -156,14 +156,14 @@
       L"What reconstructs the image (NVIDIA DLSS / AMD FidelityFX FSR). Auto: DLSS where available, otherwise FSR. Off is not saved.")                          \
     X(S_HELP_OUTSCALE, L"DLSS vytvoří větší obraz a zmenší ho zpět (jako DLDSR): ostřejší, ale dražší. Hra kreslí "  \
                        L"vždy nativně, 1.0× = DLAA. FSR běží vždy nativně (Native AA).",                             \
-      L"DLSS renders a larger image and scales it back down (like DLDSR): sharper but slower. The game always "      \
-      L"renders at native resolution, 1.0× = DLAA. FSR always runs at native resolution (Native AA).")              \
+      L"DLSS renders a larger image and scales it down (like DLDSR): sharper, slower. 1.0× = DLAA. "                \
+      L"FSR: native only (Native AA).")                                                                              \
     X(S_OUT_NATIVE, L"1.0× (nativní)", L"1.0× (native)")                                                             \
     X(S_ST_SUPERSAMPLE, L"supersampling", L"supersampling")                                                          \
-    X(S_HELP_PRESET, L"K: nejklidnější ploty, nejlépe se supersamplem 4/3–1,5×. L: klidný až od 2× (drahé). "         \
-                     L"M: jen nativně, se supersamplem bliká. S frame generation se neklid L i M zesílí – s FG K.",  \
-      L"K: calmest fences, best with 4/3–1.5x supersampling. L: calm only from 2x (costly). "                        \
-      L"M: native only, shimmers with supersampling. Frame generation amplifies L/M shimmer - use K with FG.")       \
+    X(S_HELP_PRESET, L"K: nejklidnější ploty (nejlépe 4/3–1,5×). L: klidný od 2× (drahé). M: jen nativně. "            \
+                     L"S Frame Generation používej K.",                                                              \
+      L"K: calmest fences (best 4/3–1.5×). L: calm from 2× (costly). M: native only. "                              \
+      L"Use K with Frame Generation.")                                                                               \
     X(S_PRE_K, L"K – doporučeno", L"K – recommended")                                                                \
     X(S_PRE_L, L"L – experimentální", L"L – experimental")                                                          \
     X(S_PRE_M, L"M – experimentální", L"M – experimental")                                                          \
@@ -174,7 +174,7 @@
       L"Sharper scene textures for DLSS / FSR. −1 causes moiré on grates, hence the default −0.5.")                        \
     X(S_HELP_MIPBIAS_B, L"Při zmenšeném renderu: log2(render/výstup) + bias, jako DLAA, jen log2(r), nebo vypnuto.", \
       L"With reduced render: log2(render/output) + bias, as DLAA, log2(r) only, or off.")                            \
-    X(S_HELP_OBJMV, L"Motion vektory pro postavy, dveře, výtahy a vagonky: méně duchů za pohyblivými objekty.",      \
+    X(S_HELP_OBJMV, L"Pohybové vektory pro postavy, dveře, výtahy a vagonky: méně duchů za pohyblivými objekty.",      \
       L"Motion vectors for characters, doors, lifts and trams: less ghosting behind moving objects.")                \
     X(S_HELP_ECO, L"Experimentální: menší render, mod opravuje efekty enginu. F4 nebo dlss_q / dlss_b / dlss_nat.",   \
       L"Experimental: smaller render, the mod patches engine effects. F4 or dlss_q / dlss_b / dlss_nat.")            \
@@ -189,7 +189,7 @@
     X(S_HELP_FG_REALCAP, L"Hra sama kreslí nejvýš tolik FPS, zbytek do výstupu doplní FG. Vyp = nejmenší odezva.",     \
       L"The game itself renders at most this; FG fills up to the output. Off = lowest latency.")                   \
     X(S_HELP_FG_FILL, L"Generovat, až hra klesne pod tuto hranici (auto 90 % výstupu); nad 95 % nic.",     \
-      L"Generate once the game drops below this (auto 90 % of output); above 95 % nothing.")             \
+      L"Generate once the game drops below this (auto 90% of output); above 95% nothing.")             \
     X(S_HELP_FG_STATE, L"Skutečné + generované = zobrazené FPS a čas generátoru na snímek. Při otevřeném menu jen s Pozastavit v menu.",   \
       L"Rendered + generated = displayed FPS and generator time per frame. Paused in the menu only with Pause in menu.")       \
     X(S_HELP_FG_MULT, L"Zobrazené snímky na 1 skutečný. Víc = méně skutečných, delší odezva; pro 240 Hz+ a úsporu.", \
@@ -198,10 +198,10 @@
       L"Small line top-right: real / displayed FPS (one number without FG).")                                        \
     X(S_HELP_OVERLAYVER, L"Řádek vpravo nahoře: běžící upscaler a FG s verzí a násobkem (i bez ukazatele FPS).",     \
       L"Line top-right: running upscaler and FG with version and multiplier (also without FPS).")                    \
-    X(S_HELP_LATENCY, L"Když hru brzdí grafická karta, mod zkrátí frontu snímků a odezva myši je rychlejší.",        \
-      L"When the GPU is the bottleneck, the mod shortens the frame queue so input feels more responsive.")           \
+    X(S_HELP_LATENCY, L"Když hru brzdí grafická karta, mod zkrátí frontu snímků a odezva je rychlejší (podobné NVIDIA Reflex).",        \
+      L"When the GPU is the bottleneck, the mod shortens the frame queue for faster input (similar to NVIDIA Reflex).")           \
     X(S_HELP_INPUT, L"Jak DLSS dostává barvu: LDR (8 bit), lineární HDR, s auto expozicí, nebo s inverzním TM.",     \
-      L"How DLSS receives colour: LDR (8 bit), linear HDR, with auto exposure, or with inverse tone mapping.")        \
+      L"How DLSS receives color: LDR (8 bit), linear HDR, with auto exposure, or with inverse tone mapping.")        \
     X(S_HELP_DEPTH, L"Minimum 3×3 tlumí chvění pletiva. Konstantní je jen diagnostika (neukládá se).",               \
       L"Minimum 3×3 reduces shimmer on wire mesh. Constant is diagnostics only (not saved).")                        \
     X(S_HELP_PHASES, L"Délka sekvence jitteru. 8 je na plotech v BMS nejstabilnější, auto = 8·S².",                  \
@@ -226,7 +226,7 @@
       L"A short line top-left when a setting is changed with an Alt key (key changes are not saved).")               \
     X(S_HELP_SCALE, L"Velikost textu menu a OSD.", L"Text size of the menu and OSD.")                                \
     X(S_HELP_MENUPOS, L"Kam se menu kreslí – mimo střed zůstane obraz volný pro porovnání nastavení.",                \
-      L"Where the menu is drawn – off-centre leaves the picture free for comparing settings.")                      \
+      L"Where the menu is drawn – off-center leaves the picture free for comparing settings.")                      \
     X(S_HELP_TESTKEYS, L"Alt+F9: FG vyp → DLSS-G → FSR. Alt+F10: DLSS ↔ FSR. Změny z kláves se neukládají.",       \
       L"Alt+F9: FG off → DLSS-G → FSR. Alt+F10: DLSS ↔ FSR. Changes made with these keys are not saved.")         \
     /* OSD */                                                                                                        \
@@ -241,6 +241,8 @@
       L"Frame Generation requires a restart – turn it on in the menu and restart the game")                         \
     X(S_OSD_FAIL_FG, L"Frame Generation selhala – vypnuta do restartu hry, podrobnosti v bms_dlss.log",               \
       L"Frame Generation failed – off until the game restarts, details in bms_dlss.log")                            \
+    X(S_OSD_FAIL_FG_RETRY, L"Frame Generation se nestihla spustit – nový pokus: vypni a zapni ji v menu",           \
+      L"Frame Generation did not start in time – to retry, turn it off and on in the menu")                         \
     X(S_OSD_FAIL_BRIDGE, L"DLSS / FSR přestalo běžet – vypnuto do restartu hry, podrobnosti v bms_dlss.log",          \
       L"DLSS / FSR stopped working – off until the game restarts, details in bms_dlss.log")                         \
     X(S_OSD_SAFESTART, L"Minulé spuštění skončilo chybou – Frame Generation je pro tento start vypnutá",             \

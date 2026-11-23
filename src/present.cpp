@@ -61,7 +61,7 @@ namespace {
 // ---- konfigurace ----
 struct PCfg {
     bool on = false;
-    DWORD startTimeoutMs = 10000;  // helper nema swapchain do tolika ms -> zaloha
+    DWORD startTimeoutMs = 30000;  // helper nema swapchain do tolika ms -> zaloha (bez pauz hry a dlouhe prace helperu)
     DWORD hangMs = 2000;           // helper nepotvrdil snimek tolik ms -> nereaguje -> zaloha
     DWORD probeMs = 1000;          // zaloha: interval sondy okna hry
     DWORD probeMaxSec = 300;       // zaloha: sondu po tolika s vzdat (zustava dcerine okno)
@@ -343,7 +343,9 @@ bool g_dxvkOnGame;        // DXVK uz nekdy prezentoval primo do okna hry (drzi n
 unsigned g_switches;       // pocet prepnuti presenteru za behu (log)
 LONGLONG g_switchQpc;      // zacatek posledniho zapnuti presenteru (mereni: zapnuti -> prvni snimek od helperu)
 ULONGLONG g_startTick, g_ackTick;
+ULONGLONG g_startChk, g_startPaused;  // limit startu: posledni kontrola a cas, kdy limit stal (pauza hry, prace helperu)
 uint64_t g_lastAck;
+bool g_fbRetry;  // zaloha jen z casoveho limitu startu (helper zije): vypnuti FG v menu -> PS_OFF, dalsi zapnuti = novy pokus
 // zaloha
 HWND g_child;
 bool g_direct;  // DXVK prezentuje primo do okna hry
@@ -966,6 +968,7 @@ bool g_safeStartHit;
 
 void Fallback(const char* reason) {
     const bool helperRan = g_proc != nullptr;
+    g_fbRetry = false;
     if (g_state != PS_FALLBACK && cfg.inMain && g_fgMode != BMSD_FG_OFF) InterlockedExchange(&g_fbNote, 1);
     StopHelper(1000);
     GpStop("zaloha");  // swapchain proxy pryc pred znicenim prezentacniho okna
@@ -1129,6 +1132,7 @@ bool StartPresenter(IDirect3DDevice9* d) {
     const bool restart = g_state == PS_OFF && g_sh != nullptr;
     g_switchQpc = Qpc();
     g_startTick = GetTickCount64();
+    g_startChk = g_startPaused = 0;
     if (!g_vkReady && !InitVk(d)) return Fallback("Vulkan DXVK nedostupny"), false;
     if (d != g_vkDev) return Fallback("nove hlavni zarizeni"), false;
     if (cfg.target == 1)
@@ -1406,12 +1410,26 @@ bool CheckHelper() {
         const bool gpOk = gst == BMSD_PST_PRESENTING || gst == BMSD_PST_NOWINDOW;
         if ((st == BMSD_PST_PRESENTING || (cfg.inMain && st == BMSD_PST_NOWINDOW)) && gpOk) {
             g_state = PS_HELPER;
-            Log("prezentace: helper prezentuje do okna hry (start %.2f s, zobrazuje %s)", (now - g_startTick) / 1000.0,
-                g_gpActive ? "proces hry" : "helper");
-        } else if (now - g_startTick > cfg.startTimeoutMs) {
-            Fallback(st == BMSD_PST_INUSE || gst == BMSD_PST_INUSE ? "okno hry je obsazene (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)"
-                                                                     : "helper nezacal prezentovat vcas");
-            return false;
+            Log("prezentace: helper prezentuje do okna hry (start %.2f s, z toho limit stal %.2f s, zobrazuje %s)",
+                (now - g_startTick) / 1000.0, g_startPaused / 1000.0, g_gpActive ? "proces hry" : "helper");
+        } else {
+            // Limit stoji, kdyz hra Present nevola (nacitani mapy: mezera > 0,5 s) a kdyz helper hlasi dlouhou praci
+            // hlavniho vlakna (vytvoreni generatoru se studenou cache, helperBusyTick, nejvys 30 s)
+            const ULONGLONG gap = g_startChk ? now - g_startChk : 0;
+            if (gap > 500 || (cfg.inMain && Interop_HelperBusy())) g_startPaused += gap;
+            g_startChk = now;
+            if (now - g_startTick - g_startPaused > cfg.startTimeoutMs) {
+                const bool inUse = st == BMSD_PST_INUSE || gst == BMSD_PST_INUSE;
+                Fallback(inUse ? "okno hry je obsazene (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)"
+                               : "helper did not start presenting in time");
+                // Helper zije (jen pomaly start): FG jde zkusit znovu vypnutim a zapnutim v menu
+                if (!inUse && cfg.inMain && g_proc && WaitForSingleObject(g_proc, 0) == WAIT_TIMEOUT) {
+                    g_fbRetry = true;
+                    InterlockedCompareExchange(&g_fbNote, 2, 1);
+                    Log("prezentace: Frame Generation can be retried by turning it off and on in the menu");
+                }
+                return false;
+            }
         }
     }
     // Nereaguje: nejaky snimek ceka na prevzeti a helper uz hangMs nic nepotvrdil (prevezme kazdy snimek do ms,
@@ -1421,7 +1439,8 @@ bool CheckHelper() {
         return false;
     }
     const uint64_t ack = g_sh->helperAck;
-    if (ack != g_lastAck || ack >= g_N) {
+    // Helper hlasi dlouhou praci hlavniho vlakna (helperBusyTick, nejvys 30 s): hodiny "nereaguje" stoji
+    if (ack != g_lastAck || ack >= g_N || (cfg.inMain && Interop_HelperBusy())) {
         g_lastAck = ack;
         g_ackTick = now;
     } else if (now - g_ackTick > cfg.hangMs) {
@@ -1913,8 +1932,9 @@ void Present_LoadConfig(const wchar_t* ini) {
     // Bezpecny start: minule spusteni skoncilo ztratou zarizeni GPU nebo padem procesu -> tento start bez FG (jen za
     // behu, ini se nemeni; v menu jde FG zase zapnout). [fg] SafeStart=0 vypne.
     if (g_safeStartWhy[0] && fgMode != BMSD_FG_OFF && GetPrivateProfileIntW(L"fg", L"SafeStart", 1, ini) != 0) {
-        Log("config [fg]: minule spusteni skoncilo chybou (%s) - Frame Generation (%s) je pro tento start vypnuta "
-            "([fg] SafeStart=0 vypne tuto pojistku)", g_safeStartWhy, FgModeName(fgMode));
+        Log("config [fg]: WARNING: the previous run ended with an error (%s) - Frame Generation (%s) is off for this "
+            "session; it can be turned on again in the menu ([fg] SafeStart=0 disables this safeguard)",
+            g_safeStartWhy, FgModeName(fgMode));
         fgMode = BMSD_FG_OFF;
         g_safeStartHit = true;
     }
@@ -1997,10 +2017,11 @@ void Present_LoadConfig(const wchar_t* ini) {
     const bool s2 = num(L"HelperPresent", 0) != 0;
     cfg.presAtStart = fgMode != BMSD_FG_OFF || fgForce;
     cfg.inMain = cfg.presAtStart || (cfg.live && !s2);
-    if (fgIni != fgMode) Log("config [fg]: Mode=%s zatim neni implementovano - Frame Generation vypnuto", FgModeName(fgIni));
+    if (fgIni != BMSD_FG_OFF && !FgModeImplemented(fgIni))  // (ne kvuli bezpecnemu startu - ten ma vlastni radek)
+        Log("config [fg]: Mode=%s zatim neni implementovano - Frame Generation vypnuto", FgModeName(fgIni));
     cfg.on = s2 || cfg.inMain;
     if (!cfg.on) return;  // vypnuto: nic, ani log
-    cfg.startTimeoutMs = (DWORD)num(L"StartTimeoutMs", 10000);
+    cfg.startTimeoutMs = (DWORD)num(L"StartTimeoutMs", cfg.inMain ? 30000 : 10000);
     // Hlavni helper obcas stovky ms nepotvrzuje (vytvoreni DLSS / DLSS-G feature, reimport): delsi limit nez u S2.
     // Skutecne zaseknuty helper ukonci po 5 s strazce mostu (interop.cpp) a zaloha nabehne pres konec procesu.
     cfg.hangMs = (DWORD)num(L"HangMs", cfg.inMain ? 6000 : 2000);
@@ -2064,8 +2085,10 @@ void Present_FgSetMode(int mode) {
 
 void Present_SetSafeStart(const char* why) { strncpy(g_safeStartWhy, why ? why : "", sizeof g_safeStartWhy - 1); }
 bool Present_SafeStartHit() { return g_safeStartHit; }
-bool Present_TakeFallbackNote() { return InterlockedExchange(&g_fbNote, 0) != 0; }
+int Present_TakeFallbackNote() { return (int)InterlockedExchange(&g_fbNote, 0); }
 bool Present_FgPresenterActive() { return cfg.inMain && !g_broken && !g_liveBlock && g_state != PS_FALLBACK; }
+// Zaloha jen z casoveho limitu startu: FG jde v menu / Alt+F9 vypnout a zapnout = novy pokus (FallbackToOff)
+bool Present_FgRetryable() { return cfg.inMain && !g_broken && g_state == PS_FALLBACK && g_fbRetry; }
 
 bool Present_FgModeAvailable(int mode) {
     if (mode == BMSD_FG_OFF) return true;
@@ -2477,6 +2500,28 @@ void Present_AfterReset(IDirect3DDevice9* dev, HRESULT hr) {
     Log("prezentace: Reset -> 0x%08X; okno hry %s", (unsigned)hr, win);
 }
 
+// Zaloha z casoveho limitu startu (g_fbRetry) a hrac FG v menu vypnul: zpet do PS_OFF, jako by FG byla vypnuta
+// normalne - dalsi zapnuti FG je novy pokus (RestartHelper). Jen kdyz helper zije a okno hry je volne pro DXVK.
+static bool FallbackToOff() {
+    if (!g_proc || WaitForSingleObject(g_proc, 0) != WAIT_TIMEOUT) {
+        g_fbRetry = false;
+        return false;
+    }
+    if (!g_direct) return false;  // okno hry zatim obsazene (sonda zalohy bezi) - zkusit pri dalsim snimku
+    g_fbRetry = false;
+    if (g_vkReady && FinishAll()) {
+        DestroyImages();
+        ReleaseHudlessRT();
+    } else {
+        g_w = g_h = 0;  // pri dalsim zapnuti nove sdilene obrazy (helper svuj import uvolnil)
+    }
+    g_state = PS_OFF;
+    g_limNext = 0;
+    EnterOffTarget();
+    Log("prezentace: Frame Generation turned off after a start timeout - turning it on again starts a new attempt");
+    return true;
+}
+
 HWND Present_OnPresent(IDirect3DDevice9* d, IDirect3DSwapChain9* sc, HWND h, bool isMain, void* caller,
                        void* ourHook) {
     if (!cfg.on) return h;
@@ -2487,7 +2532,10 @@ HWND Present_OnPresent(IDirect3DDevice9* d, IDirect3DSwapChain9* sc, HWND h, boo
     // jinak by stare cislo dostal dalsi snimek bez konce sceny (menu hry, nacitani)
     if (cfg.inMain) g_curBridgeN = Interop_TakeBridgeN();
     LogStats(d, caller, ourHook);
-    if (g_state == PS_FALLBACK) return FallbackTarget();
+    if (g_state == PS_FALLBACK) {
+        if (!g_fbRetry || PresenterWanted() || !FallbackToOff()) return FallbackTarget();
+        return OffTarget();
+    }
     const bool want = PresenterWanted();
     if (g_state == PS_IDLE || g_state == PS_OFF) {
         if (!want) {  // FG vypnuta: DXVK primo do okna hry (prvni snimek bez FG pri startu = rovnou PS_OFF)
