@@ -1,4 +1,4 @@
-# bms-dlss 1.0.1 – DLSS, DLAA, FSR and Frame Generation for Black Mesa
+# bms-dlss 1.1.0 – DLSS, DLAA, FSR and Frame Generation for Black Mesa
 
 Unofficial mod for **Black Mesa** (Steam, Windows). Replaces the game's anti-aliasing with **NVIDIA DLSS / DLAA** or
 **AMD FSR** and adds **frame generation** (NVIDIA DLSS Frame Generation or FSR) – a much cleaner image on fences,
@@ -10,9 +10,14 @@ wires and grates, and smooth high frame rates. Made by **Crashdown**. Česky ní
 - **AMD FSR** upscaling for any card with Vulkan (native AA).
 - **Frame Generation:**
   - **DLSS-G** (NVIDIA RTX 40 and newer): 2×, on RTX 50 up to **6×**.
-  - **FSR** (any card with Vulkan, incl. RTX 20/30, AMD, Intel): 2× (AMD FSR FG) and **3×–5×** (the mod's own
+  - **FSR** (any card with Vulkan, incl. RTX 20/30, AMD, Intel): 2× (AMD FSR FG) and **3×–6×** (the mod's own
     generator based on FSR 3.1.4). FSR frame generation has not been tested on AMD / Intel GPUs yet – reports welcome.
-  - **FSR adaptive:** generates only as many frames as are missing to reach the target.
+  - **FSR adaptive** and **DLSS-G adaptive** (DLSS-G adaptive: RTX 50): generate only as many frames as are missing to
+    reach the target.
+  - **Any output target:** a `TargetFps` number is kept exactly, also above the monitor refresh rate. If it cannot be
+    reached (at most 6×), a whole multiple of the real frame rate is shown.
+  - **When to generate** (`Preference`: balanced, responsiveness, smooth, custom, always): the adaptive modes stop
+    generating when the game alone is close enough to the target.
   - **Auto multiplier:** picks the lowest multiplier that reaches the output frame rate – real frames have priority.
   - Output FPS cap (default: monitor refresh rate minus a small margin, works with G-SYNC / FreeSync).
 - Motion vectors for moving objects and for the weapon in hand (fewer ghosting trails).
@@ -88,14 +93,28 @@ also verify the game files in Steam – the F4 line in `autoexec.cfg` then stays
   weapon has to be guessed). Less visible with more real frames.
 - With DLSS-G the driver uses its own frame generation preset; NVIDIA App / Profile Inspector overrides of the
   frame generation preset may not apply to the mod.
-- FSR frame generation 3×–5× blends very fast effects (e.g. the tau cannon beam can appear doubled in generated
+- FSR frame generation 3×–6× blends very fast effects (e.g. the tau cannon beam can appear doubled in generated
   frames).
 - `d3d9.dll` and `bms_dlss_helper.exe` are not code-signed. The menu hotkeys use a keyboard hook limited to the game
   window while the game runs (not system-wide). The mod does not connect to the internet. Some antivirus programs may
   still warn; SHA256 checksums of all files are in `SHA256SUMS.txt`.
+- Tested on one PC only (RTX 5080, 2560×1440, 165 Hz VRR). Not verified: AMD, Intel and other NVIDIA cards, monitors
+  without VRR, 4K with the adaptive modes. Slow PCs were only emulated (fewer CPU cores, paused helper).
+- A game that does not respond (long loading) is minimized late after Alt+Tab; its last image stays until then.
 - Do not use the mod in multiplayer.
 
 ## Changelog
+**1.1.0**
+- DLSS-G adaptive (RTX 50), FSR up to 6×, any output target (`TargetFps`, also above the refresh rate).
+- `Preference`: when the adaptive modes generate frames and when they show real frames only.
+- Without frame generation the image is flipped directly again (FPS above the refresh rate), frame generation can be
+  turned on and off while playing without a frozen image, and Alt+Tab shows the desktop in all these states.
+- Output without skipped frames when the frame rate reaches the display limit, steadier fractional frame pacing,
+  no long slowdown after Alt+Tab.
+- Optional lower latency with frame generation: `[latency] SampleSync=1` (off by default).
+- Diagnostic overlay (menu, off by default), self-checks written to the log.
+- Slow PCs: temporary problems are retried instead of turning frame generation off until a restart.
+
 **1.0.1**
 - Fixed: after one GPU device loss (driver reset) frame generation was turned off at every following game start.
 - Fixed: the uninstaller could replace a newer DXVK (after a Steam update) with the old backup; running it twice
@@ -119,7 +138,7 @@ also verify the game files in Steam – the F4 line in `autoexec.cfg` then stays
 
 ---
 
-# bms-dlss 1.0.1 – DLSS, DLAA, FSR a Frame Generation pro Black Mesa (česky)
+# bms-dlss 1.1.0 – DLSS, DLAA, FSR a Frame Generation pro Black Mesa (česky)
 
 Neoficiální mod pro **Black Mesa** (Steam, Windows). Nahradí vyhlazování hry za **NVIDIA DLSS / DLAA** nebo
 **AMD FSR** a přidá **generování snímků** (NVIDIA DLSS Frame Generation nebo FSR) – výrazně čistší ploty, dráty
@@ -131,7 +150,7 @@ a mříže a plynulé vysoké FPS. Autor: **Crashdown**.
 - **AMD FSR** pro všechny karty s Vulkanem (nativní vyhlazování).
 - **Frame Generation:**
   - **DLSS-G** (NVIDIA RTX 40 a novější): 2×, na RTX 50 až **6×**.
-  - **FSR** (všechny karty s Vulkanem, i RTX 20/30, AMD, Intel): 2× (FSR FG od AMD) a **3×–5×** (vlastní generátor
+  - **FSR** (všechny karty s Vulkanem, i RTX 20/30, AMD, Intel): 2× (FSR FG od AMD) a **3×–6×** (vlastní generátor
     modu založený na FSR 3.1.4). FSR Frame Generation zatím není vyzkoušené na kartách AMD / Intel – hlášení vítána.
   - **FSR adaptivní:** doplní jen tolik snímků, kolik chybí do cíle.
   - **Násobek Auto:** volí nejnižší násobek, se kterým se dosáhne výstupních FPS – skutečné snímky mají přednost.
@@ -205,14 +224,27 @@ Nouzově jde mod odstranit i ověřením souborů ve Steamu – řádek F4 v `au
   S více skutečnými snímky je menší.
 - U DLSS-G použije ovladač vlastní preset generování snímků; přepsání presetu FG v NVIDIA App / Profile Inspectoru
   se na mod nemusí uplatnit.
-- FSR Frame Generation 3×–5× velmi rychlé efekty prolíná (paprsek tau kanónu může být v generovaných snímcích
+- FSR Frame Generation 3×–6× velmi rychlé efekty prolíná (paprsek tau kanónu může být v generovaných snímcích
   dvakrát).
 - `d3d9.dll` a `bms_dlss_helper.exe` nejsou podepsané. Klávesy menu používají háček klávesnice jen pro okno hry a jen
   za jejího běhu (ne pro celý systém). Mod se nepřipojuje k internetu. Některé antiviry přesto mohou varovat;
   kontrolní součty SHA256 všech souborů jsou v `SHA256SUMS.txt`.
+- Testováno jen na jednom PC (RTX 5080, 2560×1440, 165 Hz VRR). Neověřeno: AMD, Intel a jiné karty NVIDIA, monitory bez
+  VRR, 4K s adaptivními režimy. Pomalá PC byla jen napodobena (méně jader CPU, pozastavený helper).
+- Hra, která zrovna neodpovídá (dlouhé načítání), se po Alt+Tabu minimalizuje pozdě; do té doby je vidět její obraz.
 - Mod nepoužívej v multiplayeru.
 
 ## Změny
+**1.1.0**
+- DLSS-G adaptivní (RTX 50), FSR až 6×, libovolný cíl výstupu (`TargetFps`, i nad obnovovací frekvencí).
+- `Preference`: kdy adaptivní režimy generují a kdy zobrazují jen skutečné snímky.
+- Bez Frame Generation jde obraz zase přímým flipem (FPS i nad frekvencí monitoru), FG jde zapínat a vypínat za hry bez
+  zamrznutí obrazu a Alt+Tab ve všech těchto stavech ukáže plochu.
+- Výstup bez zahazovaných snímků u stropu zobrazení, rovnoměrnější zlomkové generování, bez dlouhého zpomalení po Alt+Tabu.
+- Volitelně nižší latence s Frame Generation: `[latency] SampleSync=1` (výchozí vypnuto).
+- Diagnostický překryv (menu, výchozí vypnuto), samokontroly v logu.
+- Pomalá PC: dočasné potíže se zkoušejí znovu, FG se kvůli nim nevypne až do restartu.
+
 **1.0.1**
 - Opraveno: po jedné ztrátě zařízení GPU (reset ovladače) se Frame Generation vypínala při každém dalším startu hry.
 - Opraveno: odinstalace mohla přepsat novější DXVK (po aktualizaci Steamu) starou zálohou; opakované spuštění je teď

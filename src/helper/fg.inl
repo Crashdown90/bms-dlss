@@ -46,9 +46,22 @@ static struct FgCfg {
     double adaptSnapMs = 0.0; // [fg] AdaptiveSnapMs (pokus, 0 = vyp): rozvrh A - slot s obsahovym casem do x ms od
                               // skutecneho snimku (pred nim i za nim) ukaze skutecny snimek misto mezisnimku
                               // (nahrazuje AdaptSnapPct)
-    int vblankGrid = 0;       // [fg] VblankGrid (pokus, 0 = vyp; jen s PresentTiming=1): rozvrh A na monitoru bez VRR -
+    int adaptGpuDone = 1;     // [fg] AdaptGpuDone: rozvrh A - doba "post -> hotovo na GPU" pro posun L z vlakna hlidani
+                              // GPU (kazdy snimek); 0 = jen z vlakna presentu (do 1.0.1: po zaskubu zustala vysoka)
+    double adaptMarginMs = 1.0;  // [fg] AdaptMarginMs: rozvrh A - rezerva posunu L nad interval + hotovo na GPU (ms)
+    int vblankGrid = 0;      // [fg] VblankGrid (pokus, 0 = vyp; jen s PresentTiming=1): rozvrh A na monitoru bez VRR -
                               // mrizka s periodou obnovy (namerenou) a fazi zamcenou na cas zobrazeni (vblank)
     double vblankLeadMs = 3.0;  // [fg] VblankLeadMs: volani presentu tolik ms pred vblankem, pro ktery je slot
+    // Adaptivni DLSS-G ([fg] Mode=dlssgadaptive, docs/adaptivni-dlssg-etapa2-vysledek.md)
+    int dlssgSelect = 1;      // [fg] DlssgSelect: 1 = jen potrebna volani (count, index) + uzaviraci, 0 = vzdy cela
+                              // sekvence 1..count (podle dokumentace NGX; drazsi, nepotrebne vystupy se zahodi)
+    int dlssgFareyMax = 5;    // [fg] DlssgFareyMax: nejvyssi MultiFrameCount (2..5) = casy mezisnimku k / (n + 1), n <= max
+    int dlssgWatch = 1;       // [fg] DlssgWatch: hlidani vybranych mezisnimku za behu (miniatury) a prepnuti na DlssgSelect=0
+                              // (2 = jen merit a logovat, vyber nevypinat - ladeni)
+    int dlssgWatchLog = 0;    // [fg] DebugDlssgWatchLog (ladeni): zapsat do logu tolik posouzenych mezisnimku
+    int dlssgBreak = 0;       // [fg] DebugDlssgBreak (ladeni): 1 = vyber bez uzaviraciho volani (vadne vystupy - test hlidani)
+    int scTest = 0;           // [debug] SelfCheckTest (ladeni samokontrol proxy): bit 1 (hodnota 2) = adaptivni rezimy
+                              // se podle odhadu "hra by cil stihla i bez generovani" nevypinaji (stav pred v102s)
 } g_fgCfg;
 
 // ---- Vulkan funkce navic (swapchain, cekani na semafor, cteni obrazu) ----
@@ -100,7 +113,7 @@ static uint64_t g_fgLastN;
 // Nasobek FG ([fg] Multiplier, menu): 2x = 1 generovany snimek na skutecny, 3x = 2, 4x = 3 (jen DLSS-G na GPU, ktere
 // to umi - NGX MultiFrameCountMax). Generovane snimky jednoho skutecneho lezi v interp[0..n-1] (v case 1/N, 2/N, ...).
 static const int kFgMaxInterp = 5;  // DLSS-G 6x = 5 (od v25j; RTX 50, MultiFrameCountMax 5)
-static const int kAfgMaxInterp = 4; // adaptivni FSR az 4 generovane na skutecny (FgAfgGrowInterp)
+static const int kAfgMaxInterp = 5; // FSR (AFG) az 5 generovanych na skutecny = 6x (v103h; driv 4)
 static const int kFgOut = 4;
 enum { FGO_FREE, FGO_QUEUED, FGO_BUSY };
 struct FgOut {
@@ -294,15 +307,15 @@ static LONGLONG g_fgStatQpc, g_fgLastPostQpc;
 static double g_fgIntervalMs = 12.66;
 
 // ---- Adaptivni FSR (BMSD_FG_FSRADAPT): generator AFG (src/helper/afg) + rozvrh A / B ----
-// Nejkratsi interval mezi presenty (strop VRR / limiter ovladace: 1000 / (f - f^2/3600) ms), plati pro vsechny rezimy;
-// nastavuje hlavni vlakno z frekvence od proxy, 0 = bez omezeni.
+// Nejkratsi interval mezi presenty (strop VRR: 1000 / (f - f^2/3600) ms; rucni cil nad nim pul periody cile), plati pro
+// vsechny rezimy; nastavuje hlavni vlakno z outCapMilli od proxy, 0 = bez omezeni.
 static volatile LONGLONG g_ptMinIvQ;
 static bool g_afgAvail = true;          // AFG je prelozene v helperu; selhani vytvoreni -> g_fgFailedM
 static bool g_afgOk;                    // kontext AFG existuje
 static int g_afgLastSlot = -1;          // slot prikazu posledniho paru AFG (musi dobehnout pred dalsim zaznamem)
 static uint64_t g_afgFrameId;           // frameId paru AFG (+1 za kazdy AfgRecordPair)
 static bool g_afgPrevPaired;            // minuly skutecny snimek prosel AfgRecordPair (dalsi par navazuje)
-static volatile double g_adDoneMs = 3.0;  // vlakno presentu: EMA postQpc -> snimek hotov na GPU (ms)
+static volatile double g_adDoneMs = 3.0;  // vlakno hlidani GPU (AdaptGpuDone=0: vlakno presentu): EMA postQpc -> snimek hotov na GPU (ms)
 static volatile double g_adLateMs;        // vlakno presentu: nejvetsi zpozdeni slotu A od posledniho cteni (ms)
 static struct {
     bool active;                        // A: hystereze - generuje (jinak jen skutecne snimky)
@@ -325,10 +338,53 @@ static struct {
     uint64_t winShown0 = 0, winGen0 = 0;
     unsigned winReal = 0, lowGain = 0, uselessOff = 0;
     double lastGain = 0.0, backoffS = 5.0;
+    // A: zbytecne generovani - hra by cil (horni hranici) stihla i bez nej: cena generatoru na GPU na skutecny snimek
+    // (EMA z casovych razitek) se odecte od intervalu skutecnych snimku. Bez toho se drahy generator (DLSS-G ~2 ms na
+    // skutecny snimek) sam udrzel: hra s nim nedosahla horni hranice, takze se nikdy nevypnul (v102s).
+    double genMsEma = 0.0;
+    LONGLONG costSince = 0, costOffAt = 0, costBlockUntil = 0;
+    double costBackoffS = 5.0, costEst = 0.0;
+    unsigned costOff = 0;
+    uint32_t reason = 0;                // duvod posledniho prepnuti (BMSD_ADR_*, jen log proxy "odhad FG")
+    // Samokontroly proxy ([debug] SelfCheck): jak dlouho uz plati podminka vypnuti podle odhadu (ms) a kdy se naposledy
+    // pocitala (QPC; stara hodnota po pauze snimku hry neplati), hranice vypnuti
+    double scOverMs = 0.0, scLimit = 0.0;
+    LONGLONG scOverAt = 0;
+    // A: zlomkovy zamek ([fg] AdaptLock): proxy drzi skutecne snimky na cil * q / p (BmsdPresentShared::adaptLock)
+    int lockP = 0, lockQ = 0;           // stupen od proxy (0 = bez zamku)
+    bool lockOn = false;                // skutecne snimky jsou na rytmu stupne: casy t = k / p, L o P / q kratsi
+    int lockGood = 0;                   // skutecnych snimku v rade na rytmu stupne
+    int lockMiss = 0;                   // skutecnych snimku v rade mimo rytmus (jeden ojedinely zamek nepusti)
+    double rHat = 0.0;                  // vyhlazeny cas posledniho skutecneho snimku (QPC), 0 = neni
+    bool mulCap = false;                // cil nad nejvyssim nasobkem: vystup = (maxN + 1) x skutecne (v103h)
+    unsigned slotsStretch = 0;          // statistika okna: sloty, ktere nahradilo roztazeni paru (v103h)
+    unsigned lockSlots = 0, lockLost = 0, lockStages = 0;  // statistika okna: sloty v zamku, ztraty zamku, zmeny stupne
+    FgAcc lockPh;                       // faze: obsah slotu - poloha k / p (ms)
 } g_ad;
+// ---- Adaptivni DLSS-G (BMSD_FG_DLSSGADAPT): rozvrh A jako adaptivni FSR, mezisnimky z DLSS-G vyberem volani
+// (MultiFrameCount, MultiFrameIndex) = cas k / (count + 1). Pravidla volani overena mimo hru (tools/spike_fgg/
+// fgg_select.cpp, DLSS-G 310.9.16): v paru prave jedno uzaviraci volani (index = count) a to posledni; drivejsi casy
+// neuzaviracim tvarem; kazdy par aspon jedno volani. Je to chovani mimo dokumentaci NGX, proto hlidani za behu
+// (FgDgWatch*) a zaloha "cela sekvence" (DlssgSelect=0).
+static struct {
+    bool selectOff = false;             // hlidani vyber vyplo (do konce behu cela sekvence)
+    bool verLogged = false;
+    unsigned pairs = 0, calls = 0, extra = 0, shifted = 0, dropped = 0;  // statistika okna
+    FgAcc tErr;                         // |zaokrouhleny cas - idealni cas slotu| (ms)
+    // hlidani (statistika okna logu)
+    unsigned wJudged = 0, wSusp = 0, wCopy = 0, wStill = 0;
+    FgAcc wTp;                          // |projekce - t| na miniature 64 x 36
+    unsigned trips = 0;
+} g_dg;
 // Regrese casu generatoru adaptivniho FSR na snimek: cas = par + n * mezisnimek (v24z6, jen mereni do logu)
 static double g_afgRegN, g_afgRegSx, g_afgRegSy, g_afgRegSxx, g_afgRegSxy;
 static int g_fgTsGen[kSlots] = {-1, -1, -1};
+static uint32_t g_fgTsMode[kSlots];     // rezim (BMSD_FG_*) vzorku casu generatoru ve slotu
+// Krok 0 "FG jen tam, kde se vyplati" (docs/vyzkum-fg-kde-se-vyplati.md, kap. 4.1; jen mereni): poslednich 64 vzorku
+// ceny generatoru na skutecny snimek -> dolni kvartil a prumer do BmsdPresentShared (radek proxy "odhad FG")
+static double g_fcRing[64];
+static int g_fcN, g_fcPos;
+static uint32_t g_fcMode, g_fcCount;
 
 static LONGLONG FgQpc() {
     LARGE_INTEGER t;
@@ -678,7 +734,7 @@ static bool FgPtWaitCmds(uint64_t ns) {
 
 static void FgPtDestroySwapchain(const char* why) {
     if (!g_ptSc) return;
-    if (FgPtWaitCmds(2000000000ull)) {
+    if (FgPtWaitCmds(kGpuTimeoutNs)) {
         std::lock_guard<std::mutex> lk(*g_presQMx);
         fvk.vkQueueWaitIdle(g_presQueue);
     }
@@ -922,6 +978,7 @@ static bool FgPtEnsureSwapchain() {
 // Ovladac zapina VRR jen procesu s oknem v popredi (docs/vrr-diagnostika-vysledek.md): helper proto do swapchainu
 // neprezentuje, ale v case presentu obraz zkopiruje do sdileneho obrazu a proxy ho v procesu hry zobrazi.
 static bool g_gpOn;                    // tento beh presentu: zobrazuje proxy (gpEnable pri startu / znovuzapnuti)
+static LONGLONG g_gpShowReal;          // postQpc skutecneho snimku zobrazovane polozky (gpRealQpc, mereni latence proxy)
 static bool g_gpEarly;                 // gpEnable bit 1: zverejnit hned po kopii, gpPostQpc = cilovy cas presentu
 static LONGLONG g_gpWantQ;             // casne zverejneni: cilovy cas dalsiho presentu podle rozvrhu (0 = hned / strop)
 static HANDLE g_gpGame;                // proces hry (PROCESS_DUP_HANDLE)
@@ -999,7 +1056,7 @@ static bool GpCreate(uint32_t w, uint32_t h) {
     if (!g_gpGetSemH)
         g_gpGetSemH = (PFN_vkGetSemaphoreWin32HandleKHR)vk.vkGetDeviceProcAddr(g_dev, "vkGetSemaphoreWin32HandleKHR");
     if (!g_gpGetMemH || !g_gpGetSemH) return GpFail("chybi export handle (VK_KHR_external_*_win32)");
-    if (!FgPtWaitCmds(2000000000ull)) return GpFail("GPU nedobehla pred novymi obrazy");
+    if (!FgPtWaitCmds(kGpuTimeoutNs)) return GpFail("GPU nedobehla pred novymi obrazy");
     GpDestroy();
     for (VkSemaphore* sp : {&g_gpSemReady, &g_gpSemDone}) {
         VkExportSemaphoreCreateInfo esi = {VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, nullptr,
@@ -1114,7 +1171,7 @@ static bool GpPresentImage(VkImage src, uint32_t sw, uint32_t sh_, bool generate
     const int c = g_ptCmdIdx;
     g_ptCmdIdx ^= 1;
     if (g_ptFenceUsed[c]) {
-        if (vk.vkWaitForFences(g_dev, 1, &g_ptFence[c], VK_TRUE, 2000000000ull) != VK_SUCCESS)
+        if (WaitFenceLong(g_ptFence[c], kGpuTimeoutNs, "FG: kopie pro zobrazeni") != VK_SUCCESS)
             return FgPresFatal("GPU nedobehla (kopie pro zobrazeni)"), false;
         vk.vkResetFences(g_dev, 1, &g_ptFence[c]);
         g_ptFenceUsed[c] = false;
@@ -1170,7 +1227,12 @@ static bool GpPresentImage(VkImage src, uint32_t sw, uint32_t sh_, bool generate
     if (g_gpWantQ > target && FgQpc() < g_gpWantQ) target = g_gpWantQ;  // rozvrh (FgPtWaitFor) pri casnem zverejneni
     g_gpWantQ = 0;
     auto publish = [&](LONGLONG t, uint32_t fl) {
+        if (g_ps->gpQueue) fl |= 4u;
+        g_ps->gpQFlags[k] = fl;
+        g_ps->gpQReal[k] = (uint64_t)g_gpShowReal;
+        g_ps->gpQPost[k] = (uint64_t)t;
         g_ps->gpFlags = fl;
+        g_ps->gpRealQpc = (uint64_t)g_gpShowReal;
         g_ps->gpPostQpc = (uint64_t)t;
         InterlockedExchange64((volatile LONG64*)&g_ps->gpPub,
                               (LONG64)((((uint64_t)(uint32_t)g_gpGen & 0xFFFFull) << 48) | (seq & 0xFFFFFFFFFFFFull)));
@@ -1219,7 +1281,7 @@ static bool FgPtPresentImage(VkImage src, uint32_t sw, uint32_t sh_, bool genera
     const int c = g_ptCmdIdx;
     g_ptCmdIdx ^= 1;
     if (g_ptFenceUsed[c]) {
-        if (vk.vkWaitForFences(g_dev, 1, &g_ptFence[c], VK_TRUE, 2000000000ull) != VK_SUCCESS)
+        if (WaitFenceLong(g_ptFence[c], kGpuTimeoutNs, "FG: blit presentu") != VK_SUCCESS)
             return FgPresFatal("GPU nedobehla (blit presentu)"), false;
         vk.vkResetFences(g_dev, 1, &g_ptFence[c]);
         g_ptFenceUsed[c] = false;
@@ -1447,11 +1509,15 @@ static void FgPtPresentItem(const FgItem& it, bool behind) {  // behind: s Catch
     const LONGLONG tReady = FgQpc();
     if (it.postQpc) {
         const double dn = FgMs(it.postQpc, tReady);
-        if (!readyBefore && dn > 0.0 && dn < 100.0) g_adDoneMs = g_adDoneMs + 0.1 * (dn - g_adDoneMs);
+        // (jen AdaptGpuDone=0: vzorky jen kdyz vlakno na polozku ceka - v rozvrhu A s velkym L skoro nikdy, odhad pak
+        // zustal na hodnote ze zaskubu a L o ~14 ms vys; jinak meri vlakno hlidani GPU kazdy snimek)
+        if (!g_fgCfg.adaptGpuDone && !readyBefore && dn > 0.0 && dn < 100.0)
+            g_adDoneMs = g_adDoneMs + 0.1 * (dn - g_adDoneMs);
         std::lock_guard<std::mutex> lk(g_fgStatMx);
         g_ptSt.done.add(dn);
     }
     const FgOut& o = g_fgOut[it.slot];
+    g_gpShowReal = it.content[kFgMaxInterp];
     if (it.fixedTimes) {
         // Adaptivni FSR, rozvrh A: kazdy snimek ve svem case mrizky. Pozdni slot (L jeste nestaci) jde hned, zpozdeni se
         // hlasi hlavnimu vlaknu (zvetsi L); slot pozde o vic nez 2 periody se zahodi (obsah uz je stary).
@@ -1587,6 +1653,8 @@ static void FgGpuWatchThread() {
             std::lock_guard<std::mutex> lk(g_fgStatMx);
             g_ptSt.gpuDone.add(ms);
         }
+        // rozvrh A: posun L potrebuje dobu do "hotovo na GPU" (EMA kazdeho snimku, bez vyberu jen pozdnich vzorku)
+        if (g_fgCfg.adaptGpuDone && ms < 100.0) g_adDoneMs = g_adDoneMs + 0.1 * (ms - g_adDoneMs);
         if (g_sh) {
             pub = (pub + 1) & 0xFFFFu;
             if (!pub) pub = 1;
@@ -1598,7 +1666,7 @@ static void FgGpuWatchThread() {
 static void FgPtStop() {
     FgPtDestroySwapchain("zadost proxy / konec");
     FgPtDestroySurface();
-    if (g_gpImg[0].img && FgPtWaitCmds(2000000000ull)) GpDestroy();  // zobrazeni v procesu hry: obrazy pryc
+    if (g_gpImg[0].img && FgPtWaitCmds(kGpuTimeoutNs)) GpDestroy();  // zobrazeni v procesu hry: obrazy pryc
     g_ptStopped = true;
     if (g_ps && g_ps->helperState != BMSD_PST_FAILED) FgSetPresState(BMSD_PST_STOPPED);
 }
@@ -1677,7 +1745,7 @@ static void FgResume() {
 static bool FgWaitGpuIdle() {
     for (int i = 0; i < kSlots; ++i)
         if (g_fgFenceUsed[i]) {
-            if (vk.vkWaitForFences(g_dev, 1, &g_fgFence[i], VK_TRUE, kGpuTimeoutNs) != VK_SUCCESS) return false;
+            if (WaitFenceLong(g_fgFence[i], kGpuTimeoutNs, "FG: GPU v klidu") != VK_SUCCESS) return false;
             vk.vkResetFences(g_dev, 1, &g_fgFence[i]);
             g_fgFenceUsed[i] = false;
             g_fgTsUsed[i] = false;
@@ -2058,9 +2126,269 @@ static void FgUiaRecord(VkCommandBuffer cmd, int k, bool hl, const FgSnap& sn) {
     PB(cmd, CS, ALL, 1, &b2);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Adaptivni DLSS-G: hlidani vybranych mezisnimku za behu. Skutecny snimek (vystup "real") a zobrazene mezisnimky se
+// na GPU zmensi na 64 x 36 (retez polovicnich blitu = prumer bloku), miniatury se o par snimku pozdeji prectou a na
+// CPU se z jasu (64 x 36, 32 x 18, 16 x 9) posoudi kazdy mezisnimek G mezi skutecnymi A (minuly) a B (aktualni):
+//   kopie      = min(MAE(G, A), MAE(G, B)) / MAE(A, B) < 0.05,
+//   spatny cas = projekce tp = <G - A, B - A> / |B - A|^2 se od planovaneho t lisi o > 0.10 na vsech trech urovnich.
+// Jas kazde miniatury se normuje na prumer 100 (ve hre: roztmivani po nacteni mapy a zmeny expozice meni jas bez
+// pohybu a DLSS-G jas nemicha linearne - bez normovani to vypadalo jako spatny cas). Soudi se jen pri dostatecnem
+// pohybu (MAE(A, B) >= 0.5), ne v tmave scene a ne prvnich ~30 paru po zacatku generovani / resetu. Kdyz je ve dvou
+// oknech ~2 s po sobe podezrelych > 50 % z aspon 20 posouzenych, vyber se do konce behu vypne (cela sekvence,
+// DlssgSelect=0) a zapise se to do logu.
+// ---------------------------------------------------------------------------------------------------------------
+static const int kDwW = 64, kDwH = 36, kDwLv = 10;
+static const int kDwPix = kDwW * kDwH + (kDwW / 2) * (kDwH / 2) + (kDwW / 4) * (kDwH / 4);
+static const VkDeviceSize kDwBytes = (VkDeviceSize)kDwW * kDwH * 4;
+static struct {
+    bool ok = false, failed = false;
+    uint32_t w = 0, h = 0;
+    OwnImg lv[kDwLv], thumb;
+    int nLv = 0;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    const uint8_t* ptr = nullptr;
+    struct {
+        bool used = false;
+        uint64_t N = 0;
+        int nG = 0;
+        float t[kFgMaxInterp] = {};
+        char calls[48] = "";  // volani paru (ladeni)
+    } pend[kSlots];
+    uint64_t prevN = 0;
+    bool prevOk = false;
+    float prev[kDwPix] = {};
+    bool prevDark = false;
+    unsigned ctr = 0;
+    int holdoff = 0;   // tolik dalsich paru nesoudit (zacatek generovani, reset)
+    LONGLONG winStart = 0;
+    unsigned judged = 0, susp = 0, badWins = 0;
+} g_dw;
+
+static void FgDgWatchDestroy() {
+    for (OwnImg& o : g_dw.lv) DestroyOwn(o);
+    DestroyOwn(g_dw.thumb);
+    if (g_dw.buf) fvk.vkDestroyBuffer(g_dev, g_dw.buf, nullptr);
+    if (g_dw.mem) vk.vkFreeMemory(g_dev, g_dw.mem, nullptr);
+    g_dw.buf = VK_NULL_HANDLE;
+    g_dw.mem = VK_NULL_HANDLE;
+    g_dw.ptr = nullptr;
+    g_dw.ok = false;
+    g_dw.nLv = 0;
+    g_dw.prevOk = false;
+    for (auto& p : g_dw.pend) p.used = false;
+}
+
+// Obrazy retezu a buffer pro cteni (jednou pro velikost backbufferu; GPU nemusi byt v klidu - nic se nerusi)
+static bool FgDgWatchCreate() {
+    if (g_dw.ok && g_dw.w == g_fgBbW && g_dw.h == g_fgBbH) return true;
+    if (g_dw.failed || g_dw.ok) return false;  // (jina velikost: FgDestroyOut hlidani zrusil, sem se s ok nedojde)
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!FormatHas(g_fgFmt, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
+        g_dw.failed = true;
+        Log("FG: hlidani DLSS-G - format %d neumi blit, hlidani vypnuto", (int)g_fgFmt);
+        return false;
+    }
+    bool ok = true;
+    uint32_t cw = g_fgBbW, ch = g_fgBbH;
+    int n = 0;
+    BeginInitCmd();
+    VkImageMemoryBarrier b[kDwLv + 1];
+    uint32_t nb = 0;
+    while (ok && n < kDwLv && cw / 2 >= (uint32_t)kDwW && ch / 2 >= (uint32_t)kDwH) {
+        cw /= 2;
+        ch /= 2;
+        ok = MakeOwnImage(g_dw.lv[n], g_fgFmt, usage, cw, ch);
+        if (ok) b[nb++] = IB(g_dw.lv[n].img, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        ++n;
+    }
+    if (ok) ok = MakeOwnImage(g_dw.thumb, g_fgFmt, usage, kDwW, kDwH);
+    if (ok) b[nb++] = IB(g_dw.thumb.img, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    if (nb) PB(g_initCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, nb, b);
+    vk.vkEndCommandBuffer(g_initCmd);
+    if (SubmitInitCmd() != VK_SUCCESS) ok = false;
+    if (ok) {
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = kDwBytes * (kFgMaxInterp + 1) * kSlots;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ok = vk.vkCreateBuffer(g_dev, &bci, nullptr, &g_dw.buf) == VK_SUCCESS;
+        if (ok) {
+            VkMemoryRequirements req = {};
+            vk.vkGetBufferMemoryRequirements(g_dev, g_dw.buf, &req);
+            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size,
+                                       HostVisibleType(req.memoryTypeBits)};
+            void* p = nullptr;
+            ok = ai.memoryTypeIndex != UINT32_MAX && vk.vkAllocateMemory(g_dev, &ai, nullptr, &g_dw.mem) == VK_SUCCESS &&
+                 vk.vkBindBufferMemory(g_dev, g_dw.buf, g_dw.mem, 0) == VK_SUCCESS &&
+                 vk.vkMapMemory(g_dev, g_dw.mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS && p;
+            g_dw.ptr = (const uint8_t*)p;
+        }
+    }
+    if (!ok) {
+        FgDgWatchDestroy();
+        g_dw.failed = true;
+        Log("FG: hlidani DLSS-G - obrazy miniatur nejdou vytvorit, hlidani vypnuto");
+        return false;
+    }
+    g_dw.nLv = n;
+    g_dw.w = g_fgBbW;
+    g_dw.h = g_fgBbH;
+    g_dw.ok = true;
+    Log("FG: hlidani DLSS-G - miniatury %d x %d z %ux%u (%d kroku zmenseni)", kDwW, kDwH, g_fgBbW, g_fgBbH, n);
+    return true;
+}
+
+// Zmenseni obrazu src (GENERAL, velikost backbufferu) na miniaturu a kopie do bufferu na misto (slot prikazu c, poradi i)
+static void FgDgWatchDown(VkCommandBuffer cmd, VkImage src, int c, int i) {
+    const VkImageAspectFlags COLOR = VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkImageLayout GEN = VK_IMAGE_LAYOUT_GENERAL;
+    const VkPipelineStageFlags ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkAccessFlags RD = VK_ACCESS_TRANSFER_READ_BIT, WR = VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkImageMemoryBarrier b = IB(src, COLOR, VK_ACCESS_SHADER_WRITE_BIT | WR, RD, GEN, GEN);
+    PB(cmd, ALL, ALL, 1, &b);
+    VkImage cur = src;
+    uint32_t cw = g_dw.w, ch = g_dw.h;
+    for (int l = 0; l <= g_dw.nLv; ++l) {
+        const OwnImg& d = l < g_dw.nLv ? g_dw.lv[l] : g_dw.thumb;
+        b = IB(d.img, COLOR, RD | WR, WR, GEN, GEN);
+        PB(cmd, ALL, ALL, 1, &b);
+        VkImageBlit bl = {};
+        bl.srcSubresource = {COLOR, 0, 0, 1};
+        bl.dstSubresource = {COLOR, 0, 0, 1};
+        bl.srcOffsets[1] = {(int32_t)cw, (int32_t)ch, 1};
+        bl.dstOffsets[1] = {(int32_t)d.w, (int32_t)d.h, 1};
+        vk.vkCmdBlitImage(cmd, cur, GEN, d.img, GEN, 1, &bl, VK_FILTER_LINEAR);
+        b = IB(d.img, COLOR, WR, RD, GEN, GEN);
+        PB(cmd, ALL, ALL, 1, &b);
+        cur = d.img;
+        cw = d.w;
+        ch = d.h;
+    }
+    VkBufferImageCopy r = {};
+    r.bufferOffset = kDwBytes * ((VkDeviceSize)c * (kFgMaxInterp + 1) + (VkDeviceSize)i);
+    r.imageSubresource = {COLOR, 0, 0, 1};
+    r.imageExtent = {(uint32_t)kDwW, (uint32_t)kDwH, 1};
+    fvk.vkCmdCopyImageToBuffer(cmd, g_dw.thumb.img, GEN, g_dw.buf, 1, &r);
+}
+
+// Jas tri urovni z miniatury BGRA8 / RGBA8 (poradi kanalu nehraje roli: (c0 + 2 c1 + c2) / 4), normovany na prumer
+// 100. Vraci false pro tmavy obraz (prumer pod 4 z 255: nenormuje se a nesoudi).
+static bool FgDgWatchLuma(const uint8_t* px, float* out) {
+    float* l0 = out;
+    float* l1 = l0 + kDwW * kDwH;
+    float* l2 = l1 + (kDwW / 2) * (kDwH / 2);
+    double sum = 0.0;
+    for (int i = 0; i < kDwW * kDwH; ++i) {
+        l0[i] = ((float)px[i * 4] + 2.0f * (float)px[i * 4 + 1] + (float)px[i * 4 + 2]) * 0.25f;
+        sum += l0[i];
+    }
+    const double mean = sum / (kDwW * kDwH);
+    const bool bright = mean >= 4.0;
+    if (bright) {
+        const float k = (float)(100.0 / mean);
+        for (int i = 0; i < kDwW * kDwH; ++i) l0[i] *= k;
+    }
+    for (int y = 0; y < kDwH / 2; ++y)
+        for (int x = 0; x < kDwW / 2; ++x)
+            l1[y * (kDwW / 2) + x] = 0.25f * (l0[2 * y * kDwW + 2 * x] + l0[2 * y * kDwW + 2 * x + 1] +
+                                              l0[(2 * y + 1) * kDwW + 2 * x] + l0[(2 * y + 1) * kDwW + 2 * x + 1]);
+    const int w1 = kDwW / 2;
+    for (int y = 0; y < kDwH / 4; ++y)
+        for (int x = 0; x < kDwW / 4; ++x)
+            l2[y * (kDwW / 4) + x] = 0.25f * (l1[2 * y * w1 + 2 * x] + l1[2 * y * w1 + 2 * x + 1] +
+                                              l1[(2 * y + 1) * w1 + 2 * x] + l1[(2 * y + 1) * w1 + 2 * x + 1]);
+    return bright;
+}
+
+// Vyhodnoceni miniatur slotu prikazu c (jeho prikazy uz na GPU dobehly). Hlavni vlakno.
+static void FgDgWatchCollect(int c, LONGLONG now) {
+    auto& pd = g_dw.pend[c];
+    if (!pd.used) return;
+    pd.used = false;
+    if (!g_dw.ok || !g_dw.ptr) return;
+    const uint8_t* base = g_dw.ptr + kDwBytes * (size_t)c * (kFgMaxInterp + 1);
+    static float B[kDwPix], G[kDwPix];
+    const bool bBright = FgDgWatchLuma(base, B);
+    const bool haveA = g_dw.prevOk && g_dw.prevN + 1 == pd.N && bBright && !g_dw.prevDark;
+    const float* A = g_dw.prev;
+    const int n0 = kDwW * kDwH, n1 = (kDwW / 2) * (kDwH / 2), n2 = (kDwW / 4) * (kDwH / 4);
+    if (haveA && pd.nG > 0) {
+        double mab = 0.0;
+        for (int i = 0; i < n0; ++i) mab += fabs((double)B[i] - A[i]);
+        mab /= n0;
+        if (mab < 0.5) {
+            ++g_dg.wStill;
+        } else {
+            for (int g = 0; g < pd.nG; ++g) {
+                if (!FgDgWatchLuma(base + kDwBytes * (size_t)(g + 1), G)) continue;
+                double ga = 0.0, gb = 0.0;
+                for (int i = 0; i < n0; ++i) {
+                    ga += fabs((double)G[i] - A[i]);
+                    gb += fabs((double)G[i] - B[i]);
+                }
+                const bool copy = std::min(ga, gb) / n0 / mab < 0.05;
+                bool badAll = true;
+                double tp0 = 0.0, tpl[3] = {};
+                const int off[3] = {0, n0, n0 + n1}, cnt[3] = {n0, n1, n2};
+                for (int l = 0; l < 3; ++l) {
+                    double num = 0.0, den = 0.0;
+                    for (int i = off[l]; i < off[l] + cnt[l]; ++i) {
+                        const double d = (double)B[i] - A[i];
+                        num += ((double)G[i] - A[i]) * d;
+                        den += d * d;
+                    }
+                    const double tp = den > 1e-9 ? num / den : (double)pd.t[g];
+                    if (!l) tp0 = tp;
+                    tpl[l] = tp;
+                    if (fabs(tp - (double)pd.t[g]) <= 0.10) badAll = false;
+                }
+                if (g_fgCfg.dlssgWatchLog > 0) {
+                    --g_fgCfg.dlssgWatchLog;
+                    Log("FG hlidani: N %llu mezisnimek %d/%d t %.3f | projekce %.3f / %.3f / %.3f | r %.3f, MAE(A,B) %.2f | "
+                        "volani%s%s",
+                        (unsigned long long)pd.N, g + 1, pd.nG, pd.t[g], tpl[0], tpl[1], tpl[2], std::min(ga, gb) / n0 / mab, mab,
+                        pd.calls, copy ? " KOPIE" : badAll ? " SPATNY CAS" : "");
+                }
+                ++g_dg.wJudged;
+                ++g_dw.judged;
+                g_dg.wTp.add(fabs(tp0 - (double)pd.t[g]));
+                if (copy) ++g_dg.wCopy;
+                if (copy || badAll) {
+                    ++g_dg.wSusp;
+                    ++g_dw.susp;
+                }
+            }
+        }
+    }
+    memcpy(g_dw.prev, B, sizeof B);
+    g_dw.prevN = pd.N;
+    g_dw.prevOk = true;
+    g_dw.prevDark = !bBright;
+    // rozhodnuti: okno ~2 s s aspon 20 posouzenymi (malo pohybu: okno se protahne, nejdele 10 s)
+    if (!g_dw.winStart) g_dw.winStart = now;
+    const double el = FgMs(g_dw.winStart, now);
+    if (el >= 2000.0 && (g_dw.judged >= 20 || el >= 10000.0)) {
+        if (g_dw.judged >= 20) g_dw.badWins = g_dw.susp * 2 > g_dw.judged ? g_dw.badWins + 1 : 0;
+        if (g_dw.badWins >= 2 && !g_dg.selectOff && g_fgCfg.dlssgSelect && g_fgCfg.dlssgWatch == 1) {
+            g_dg.selectOff = true;
+            ++g_dg.trips;
+            Log("FG: adaptivni DLSS-G - HLIDANI: vybrane mezisnimky jsou vadne (%u z %u posouzenych za %.1f s, druhe okno po "
+                "sobe; DLSS-G %s) - vyber vypnut, do konce hry cela sekvence (jako [fg] DlssgSelect=0)",
+                g_dw.susp, g_dw.judged, el / 1000.0, g_fgDlssgVersion.empty() ? "?" : g_fgDlssgVersion.c_str());
+        }
+        g_dw.winStart = now;
+        g_dw.judged = g_dw.susp = 0;
+    }
+}
+
 static void FgDestroyOut() {
     FgSharpDestroy();
     FgUiaDestroy();
+    FgDgWatchDestroy();
+    g_dw.failed = false;
     for (FgOut& o : g_fgOut) {
         for (OwnImg& im : o.interp) DestroyOwn(im);
         DestroyOwn(o.real);
@@ -2117,16 +2445,10 @@ static VkResult FgImportOne(const BmsdImage& bi, Img& im, VkImageView& view) {
     return r;
 }
 
-// Dlouha prace hlavniho vlakna (blokuje potvrzovani snimku mostu): proxy ji po tu dobu nebere jako selhani helperu
-struct FgBusyScope {
-    FgBusyScope() {
-        if (g_sh) g_sh->helperBusyTick = GetTickCount() | 1u;
-        MemoryBarrier();
-    }
-    ~FgBusyScope() {
-        MemoryBarrier();
-        if (g_sh) g_sh->helperBusyTick = 0;
-    }
+// Dlouha prace hlavniho vlakna (blokuje potvrzovani snimku mostu): proxy ji po tu dobu nebere jako selhani helperu.
+// Spolecne s mostem (BusyScope v helper.cpp, obnovovany tick, vnorovani).
+struct FgBusyScope : BusyScope {
+    FgBusyScope() : BusyScope("(FG)") {}
 };
 
 // Import sdilenych obrazu presentu (nova generace od proxy) a vlastni vystupni obrazy. false = presenter selhal.
@@ -2184,6 +2506,7 @@ static bool FgImport() {
     // vyssi nasobek DLSS-G nebo adaptivni FSR je doplni pozdeji (FgGrowInterp).
     g_fgGrowFailGen = -1;
     if (ps->fgMode == BMSD_FG_FSRADAPT) g_fgInterpN = kAfgMaxInterp;
+    else if (ps->fgMode == BMSD_FG_DLSSGADAPT) g_fgInterpN = kFgMaxInterp;
     else if (ps->fgMode == BMSD_FG_DLSSG)
         g_fgInterpN = std::max(1, std::min(kFgMaxInterp, std::min((int)(ps->fgMultiplier & 0xFF), g_fgMultMax) - 1));
     else g_fgInterpN = 1;
@@ -2240,10 +2563,34 @@ static void FgFail(const char* fmt, ...) {
         g_fgCurMode == BMSD_FG_FSR2X ? "FSR FG" : g_fgCurMode == BMSD_FG_FSRADAPT ? "FSR AFG" : "DLSS-G", buf);
 }
 
+// Selhani z pomalosti (GPU nedobehla ani v dlouhem limitu, napr. strankovani VRAM pri nacitani): netrvale. Generator
+// rezimu stoji (jen skutecne snimky) a zkusi se znovu s rostoucim odstupem 10 / 20 / 40 / 80 s; trvale (FgFail) az po
+// 5 takovych selhanich za sebou bez uspesneho vytvoreni mezi nimi.
+static ULONGLONG g_fgSlowUntil[BMSD_FG_COUNT];
+static int g_fgSlowFails[BMSD_FG_COUNT];
+static void FgFailSlow(uint32_t mode, const char* what) {
+    if (++g_fgSlowFails[mode] >= 5) {
+        const uint32_t cur = g_fgCurMode;
+        g_fgCurMode = mode;
+        FgFail("%s (%dx za sebou i s dlouhymi limity)", what, g_fgSlowFails[mode]);
+        g_fgCurMode = cur;
+        return;
+    }
+    const ULONGLONG wait = 10000ull << (g_fgSlowFails[mode] - 1);
+    g_fgSlowUntil[mode] = GetTickCount64() + wait;
+    g_fgSnapWanted = false;
+    Log("FG: %s - pomale GPU / nacitani? Generator stoji (jen skutecne snimky), novy pokus za %llu s (%d/5)", what,
+        wait / 1000ull, g_fgSlowFails[mode]);
+}
+
 static bool FgHave(uint32_t mode) {
     return mode == BMSD_FG_FSRADAPT ? g_afgOk : mode == BMSD_FG_FSR2X ? g_ffg != nullptr : g_dlssg != nullptr;
 }
+// Nejvyssi MultiFrameCount pro adaptivni DLSS-G (casy k / (n + 1), n <= M); pod 2 se rezim nenabizi (RTX 40: jen 2x,
+// vyber z jedineho casu 1/2 by skubal - docs/vyzkum-adaptivni-dlssg.md)
+static int FgDgMaxCount() { return std::min(std::min(g_fgCfg.dlssgFareyMax, kFgMaxInterp), g_fgMultMax - 1); }
 static bool FgAvailFor(uint32_t mode) {
+    if (mode == BMSD_FG_DLSSGADAPT) return g_fgAvail && g_fgMultMax >= 3;
     return mode == BMSD_FG_FSRADAPT ? g_afgAvail : mode == BMSD_FG_FSR2X ? g_ffgAvail : g_fgAvail;
 }
 
@@ -2443,6 +2790,7 @@ static bool FgCreateFsr() {
 // kFgMaxInterp). Pri importu vznikaji jen podle aktualniho pozadavku. Stavajici obrazy se nemeni (jen pribudou nove),
 // vlakno presentu je behem toho zaparkovane.
 static bool FgGrowInterp(int want, const char* why) {
+    FgBusyScope busy;
     want = std::min(want, kFgMaxInterp);
     if (g_fgInterpN >= want) return true;
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -2510,19 +2858,24 @@ static bool FgCreateAfg() {
 
 static void FgEnsureFeature(uint32_t mode) {
     if (g_fgFailedM[mode] || !FgAvailFor(mode) || !g_fgImgOk || !g_ownOk) return;
-    if (FgHave(mode) && g_fgKeyBbW == g_fgBbW && g_fgKeyBbH == g_fgBbH && g_fgKeyW == g_w && g_fgKeyH == g_h) return;
+    if (FgHave(mode) && g_fgKeyBbW == g_fgBbW && g_fgKeyBbH == g_fgBbH && g_fgKeyW == g_w && g_fgKeyH == g_h) {
+        g_fgSlowFails[mode] = 0;  // generator bezi: predchozi selhani z pomalosti uz nepocitat
+        return;
+    }
+    if (g_fgSlowUntil[mode] && GetTickCount64() < g_fgSlowUntil[mode]) return;  // odstup po selhani z pomalosti
+    g_fgSlowUntil[mode] = 0;
     FgBusyScope busy;
     if (!g_fgOutStorage) return FgFail("format backbufferu %d neumi STORAGE (vystup generatoru)", (int)g_fgFmt);
     if (g_fgFmt != VK_FORMAT_B8G8R8A8_UNORM && g_fgFmt != VK_FORMAT_R8G8B8A8_UNORM)
         return FgFail("format backbufferu %d neni BGRA8 / RGBA8", (int)g_fgFmt);
     if (g_dlssg || g_ffg || g_afgOk) {
-        if (!FgWaitGpuIdle()) return FgFail("GPU nedobehla pred zmenou feature");
+        if (!FgWaitGpuIdle()) return FgFailSlow(mode, "GPU nedobehla pred zmenou feature");
         FgReleaseFeature(FgHave(mode) ? "zmena velikosti" : "zmena rezimu");
         FgDestroySnaps();
     }
     if (!FgCreateSnaps()) return FgFail("obrazy snapshotu MV / hloubky %ux%u nejdou vytvorit", g_w, g_h);
     if (mode == BMSD_FG_FSRADAPT) {
-        if (!FgWaitGpuIdle()) return FgFail("GPU nedobehla pred vytvorenim adaptivniho FSR");
+        if (!FgWaitGpuIdle()) return FgFailSlow(mode, "GPU nedobehla pred vytvorenim adaptivniho FSR");
         if (!FgCreateAfg()) {
             FgDestroySnaps();
             return;
@@ -2566,7 +2919,7 @@ static void FgEnsureFeature(uint32_t mode) {
         if (!FgWaitGpuIdle()) {
             FgResume();
             FgDestroySnaps();
-            return FgFail("GPU nedobehla pred vytvorenim DLSS-G");
+            return FgFailSlow(mode, "GPU nedobehla pred vytvorenim DLSS-G");
         }
         QueryPerformanceCounter(&q1);
         Log("FG: pred vytvorenim DLSS-G GPU v klidu (vlakno presentu zaparkovano, %.1f ms)",
@@ -2664,8 +3017,9 @@ static void FgPutMatrix(float dst[4][4], const double* m) {
 // (count + 1) mezi minulym a aktualnim skutecnym snimkem), vstupy stejne. "real" NGX kopiruje pri kazdem volani; predava
 // se pokazde (feature je vytvorena s OutputReal v ResourceAlwaysProvided, kopie stoji setiny ms). Reset plati jen
 // s idx = 1 (ostatni ho ignoruji).
+// out = cislo vystupniho obrazu interp slotu j (-1 = idx - 1; adaptivni DLSS-G: zobrazene mezisnimky od 0, zahozene za nimi).
 static NVSDK_NGX_Result FgRecordDlssg(VkCommandBuffer cmd, int k, int j, const FgSnap& sn, bool reset, bool hl, int idx,
-                                      int count) {
+                                      int count, int out = -1) {
     const VkImageSubresourceRange colorRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     const VkImageSubresourceRange depthRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
     NVSDK_NGX_Resource_VK rBB = NVSDK_NGX_Create_ImageView_Resource_VK(g_fgPresView[k], g_fgPres[k].img, colorRange,
@@ -2675,7 +3029,7 @@ static NVSDK_NGX_Result FgRecordDlssg(VkCommandBuffer cmd, int k, int j, const F
     NVSDK_NGX_Resource_VK rMv =
         NVSDK_NGX_Create_ImageView_Resource_VK(sn.mv.view, sn.mv.img, colorRange, kMvFormat, g_w, g_h, false);
     FgOut& o = g_fgOut[j];
-    const OwnImg& oi = o.interp[idx - 1];
+    const OwnImg& oi = o.interp[out >= 0 ? out : idx - 1];
     NVSDK_NGX_Resource_VK rInt =
         NVSDK_NGX_Create_ImageView_Resource_VK(oi.view, oi.img, colorRange, g_fgFmt, g_fgBbW, g_fgBbH, true);
     NVSDK_NGX_Resource_VK rReal =
@@ -2984,14 +3338,17 @@ static void FgPublishState(int32_t state, uint32_t activeMode, const char* msg) 
     }
     ps->fgAvailMask = 1u | (g_fgAvail && !g_fgFailedM[BMSD_FG_DLSSG] ? 1u << BMSD_FG_DLSSG : 0u) |
                       (g_ffgAvail && !g_fgFailedM[BMSD_FG_FSR2X] ? 1u << BMSD_FG_FSR2X : 0u) |
-                      (g_afgAvail && !g_fgFailedM[BMSD_FG_FSRADAPT] ? 1u << BMSD_FG_FSRADAPT : 0u);
+                      (g_afgAvail && !g_fgFailedM[BMSD_FG_FSRADAPT] ? 1u << BMSD_FG_FSRADAPT : 0u) |
+                      (FgAvailFor(BMSD_FG_DLSSGADAPT) && !g_fgFailedM[BMSD_FG_DLSSG] ? 1u << BMSD_FG_DLSSGADAPT : 0u);
     ps->fgAvailValid = g_fgAvailKnown ? 1 : 0;
-    ps->adaptEngaged = activeMode == BMSD_FG_FSRADAPT && g_ad.engaged ? 1u : 0u;
+    ps->adaptEngaged = (activeMode == BMSD_FG_FSRADAPT || activeMode == BMSD_FG_DLSSGADAPT) && g_ad.engaged ? 1u : 0u;
+    ps->adaptReason = g_ad.reason | (!g_ad.active && g_ad.blockUntil && FgQpc() < g_ad.blockUntil ? 0x100u : 0u);
     {  // nazev a verze generatoru, ktery existuje (menu: "DLSS-G 310.9.16 · 78 -> 156 FPS", "FSR FG 3.1.6 · ...")
         const std::string name = g_afgOk    ? std::string(ps->fgMode == BMSD_FG_FSR2X ? "FSR FG 3.1.4 (mod)" : "FSR adapt. 3.1.4")
                                  : g_ffg    ? (g_ffgVersion.empty() ? std::string("FSR FG") : "FSR FG " + g_ffgVersion)
                                  : !g_dlssg ? std::string()
-                                 : g_fgDlssgVersion.empty() ? std::string("DLSS-G") : "DLSS-G " + g_fgDlssgVersion;
+                                 : std::string(ps->fgMode == BMSD_FG_DLSSGADAPT ? "DLSS-G adapt." : "DLSS-G") +
+                                       (g_fgDlssgVersion.empty() ? std::string() : " " + g_fgDlssgVersion);
         if (strncmp(ps->fgName, name.c_str(), sizeof ps->fgName - 1)) {
             strncpy(ps->fgName, name.c_str(), sizeof ps->fgName - 1);
             ps->fgName[sizeof ps->fgName - 1] = 0;
@@ -3013,6 +3370,28 @@ static void FgPublishState(int32_t state, uint32_t activeMode, const char* msg) 
     }
 }
 
+static void FgCostSample(double ms, uint32_t mode) {
+    if (mode != g_fcMode) {  // jiny rezim: jina cena
+        g_fcMode = mode;
+        g_fcN = g_fcPos = 0;
+    }
+    g_fcRing[g_fcPos] = ms;
+    g_fcPos = (g_fcPos + 1) % 64;
+    if (g_fcN < 64) ++g_fcN;
+    ++g_fcCount;
+    BmsdPresentShared* ps = g_ps;
+    if (!ps) return;
+    double t[64], sum = 0.0;
+    for (int i = 0; i < g_fcN; ++i) sum += t[i] = g_fcRing[i];
+    std::sort(t, t + g_fcN);
+    ps->fgCostQ1Ms = (float)t[(g_fcN - 1) / 4];
+    ps->fgCostMeanMs = (float)(sum / g_fcN);
+    ps->fgCostEmaMs = (float)g_ad.genMsEma;
+    ps->fgCostMode = mode;
+    MemoryBarrier();
+    ps->fgCostCount = g_fcCount;
+}
+
 static void FgCollectTs(int c) {
     if (!g_fgTsUsed[c] || !g_fgQpool) return;
     g_fgTsUsed[c] = false;
@@ -3023,7 +3402,10 @@ static void FgCollectTs(int c) {
     if (t[1] >= t[0]) {
         const double ms = (double)(t[1] - t[0]) * g_tsPeriod * 1e-6;
         g_fgSt.eval.add(ms);
+        if (g_fgTsGen[c] >= 0 && ms < 100.0)  // adaptivni rezimy: cena generatoru na skutecny snimek (vypnuti zbytecneho)
+            g_ad.genMsEma = g_ad.genMsEma > 0.0 ? g_ad.genMsEma + 0.05 * (ms - g_ad.genMsEma) : ms;
         if (g_fgTsGen[c] >= 0 && ms < 100.0) {
+            FgCostSample(ms, g_fgTsMode[c]);
             const double x = (double)g_fgTsGen[c];
             g_afgRegN += 1.0;
             g_afgRegSx += x;
@@ -3102,6 +3484,19 @@ static void FgPublishStats(LONGLONG now) {
     ps->statFgRealFps = (float)(g_fgSt.frames * 1000.0 / el);
     ps->statFgOutFps = (float)((real + gen) * 1000.0 / el);
     ps->statFgHudless = g_fgSt.hudless;
+    {  // cisla pro samokontroly proxy ([debug] SelfCheck)
+        const bool adaptMode = ps->fgMode == BMSD_FG_FSRADAPT || ps->fgMode == BMSD_FG_DLSSGADAPT;
+        // podminka vypnuti podle odhadu plati jen s cerstvym vypoctem (bez snimku hry se nepocita a cas by rostl)
+        const bool overFresh = adaptMode && g_ad.engaged && g_ad.scOverAt && now - g_ad.scOverAt < g_qpf.QuadPart / 2;
+        ps->scDropped = dropped + late;
+        ps->scGenSkipped = behind + genFail;
+        ps->scAdSlots = adaptMode ? g_ad.slots : 0u;
+        ps->scAdSlotsLost = adaptMode ? g_ad.slotsDrop + adDrop : 0u;
+        ps->scAdSwitches = adaptMode ? g_ad.switches : 0u;
+        ps->scAdCostOverMs = overFresh ? (uint32_t)g_ad.scOverMs : 0u;
+        ps->scAdCostEst = adaptMode ? (float)g_ad.costEst : 0.0f;
+        ps->scAdCostLimit = adaptMode ? (float)g_ad.scLimit : 0.0f;
+    }
     MemoryBarrier();
     ++ps->statSeq;
     if (g_fgCfg.log && g_fgSemReady) {  // ladeni: stav semaforu a fence (zaseknuti GPU)
@@ -3167,13 +3562,31 @@ static void FgPublishStats(LONGLONG now) {
                 dCont.sd(), grid, dGridN, g_ptmREst > 0.0 ? g_ptmREst : g_ptmRefreshMs,
                 dGridN < 50 ? "VRR ?" : grid > 80.0 ? "pevna frekvence (bez VRR)" : grid < 40.0 ? "VRR" : "nejasne");
         }
-        if (ps->fgMode == BMSD_FG_FSRADAPT && g_afgOk) {
+        const bool dgLog = ps->fgMode == BMSD_FG_DLSSGADAPT && g_dlssg;
+        if ((ps->fgMode == BMSD_FG_FSRADAPT && g_afgOk) || dgLog) {
             const unsigned tot = real + gen;
             char vbInfo[96] = "";
             if (g_fgCfg.vblankGrid)
                 snprintf(vbInfo, sizeof vbInfo, " | vblank: perioda %.4f ms, chyba faze %.3f ms (max %.2f, %u)",
                          (double)g_vbPeriodMs, g_ad.vbErr.avg(), g_ad.vbErr.max, g_ad.vbErr.n);
-            double regA = 0.0, regB = 0.0;  // regrese cas = A + B * n (par + mezisnimky)
+            char lkInfo[160] = "";
+            if (g_ad.lockP || g_ad.lockSlots || g_ad.lockStages)
+                snprintf(lkInfo, sizeof lkInfo, " | zamek %d/%d %s: slotu %u z %u, faze %.3f ms (sd %.3f, %.2f .. %.2f), "
+                         "ztrat %u, zmen stupne %u",
+                         g_ad.lockQ, g_ad.lockP, g_ad.lockOn ? "drzi" : "nedrzi", g_ad.lockSlots, g_ad.slots,
+                         g_ad.lockPh.avg(), g_ad.lockPh.sd(), g_ad.lockPh.n ? g_ad.lockPh.min : 0.0,
+                         g_ad.lockPh.n ? g_ad.lockPh.max : 0.0, g_ad.lockLost, g_ad.lockStages);
+            char dgInfo[400] = "";
+            if (dgLog)
+                snprintf(dgInfo, sizeof dgInfo, " | DLSS-G %s (%s, count <= %d): paru %u, volani %u (%.2f na par), navic "
+                         "uzaviracich %u, posunuto %u, vynechano %u, chyba casu %.3f ms (max %.2f) | hlidani: posouzeno %u, "
+                         "podezrelych %u (kopie %u), bez pohybu %u, |tp - t| %.3f (max %.2f), vypnuti vyberu %u",
+                         g_fgDlssgVersion.empty() ? "?" : g_fgDlssgVersion.c_str(),
+                         g_fgCfg.dlssgSelect && !g_dg.selectOff ? "vyber" : g_dg.selectOff ? "cela sekvence - hlidani" : "cela sekvence",
+                         FgDgMaxCount(), g_dg.pairs, g_dg.calls, g_dg.pairs ? (double)g_dg.calls / g_dg.pairs : 0.0, g_dg.extra,
+                         g_dg.shifted, g_dg.dropped, g_dg.tErr.avg(), g_dg.tErr.max, g_dg.wJudged, g_dg.wSusp, g_dg.wCopy,
+                         g_dg.wStill, g_dg.wTp.avg(), g_dg.wTp.max, g_dg.trips);
+            double regA = 0.0, regB = 0.0;  // regrese cas = A + B * n (par + mezisnimky; DLSS-G: par + volani)
             {
                 const double d = g_afgRegN * g_afgRegSxx - g_afgRegSx * g_afgRegSx;
                 if (g_afgRegN >= 10 && fabs(d) > 1e-9) {
@@ -3182,25 +3595,33 @@ static void FgPublishStats(LONGLONG now) {
                 }
             }
             Log("FG adaptivni %.1f s: rozvrh %s, cil %.2f FPS, %s, skutecne %.1f FPS (EMA), zobrazeno %u skutecnych + %u "
-                "generovanych (%.0f %% gen.) | prepnuti %u, zobrazeno na skutecny %.2f, vypnuto pro neuzitecnost %u | A: slotu %u (skutecny %u, zahozeno %u), L %.2f ms (max %.2f), "
+                "generovanych (%.0f %% gen.) | prepnuti %u, zobrazeno na skutecny %.2f, vypnuto pro neuzitecnost %u, jako zbytecne %u (odhad bez generatoru %.1f FPS, cena %.2f ms) | A: slotu %u (skutecny %u, zahozeno %u), L %.2f ms (max %.2f, hotovo na GPU %.2f ms), "
                 "pozde %u, zahozeno %u | odchylka obsahu slotu %.3f ms (max %.2f), prichyceno %u "
-                "(%.3f / %.2f ms) | GPU generatoru: par %.2f ms + %.2f ms na mezisnimek (regrese, %u)%s",
+                "(%.3f / %.2f ms) | GPU generatoru: par %.2f ms + %.2f ms na mezisnimek (regrese, %u)%s%s%s",
                 el / 1000.0, "A", ps->adaptTargetMilli / 1000.0,
                 g_ad.engaged ? "generuje" : "jen skutecne", g_ad.ivEma > 0 ? 1000.0 / g_ad.ivEma : 0.0, real, gen,
-                tot ? gen * 100.0 / tot : 0.0, g_ad.switches, g_ad.lastGain, g_ad.uselessOff, g_ad.slots, g_ad.slotsReal, g_ad.slotsDrop, g_ad.Lacc.avg(),
-                g_ad.Lacc.max, adLate, adDrop, g_ad.contErr.avg(), g_ad.contErr.max, g_ad.snapErr.n,
-                g_ad.snapErr.avg(), g_ad.snapErr.max, regA, regB, (unsigned)g_afgRegN, vbInfo);
+                tot ? gen * 100.0 / tot : 0.0, g_ad.switches, g_ad.lastGain, g_ad.uselessOff, g_ad.costOff, g_ad.costEst, g_ad.genMsEma, g_ad.slots, g_ad.slotsReal, g_ad.slotsDrop, g_ad.Lacc.avg(),
+                g_ad.Lacc.max, (double)g_adDoneMs, adLate, adDrop, g_ad.contErr.avg(), g_ad.contErr.max, g_ad.snapErr.n,
+                g_ad.snapErr.avg(), g_ad.snapErr.max, regA, regB, (unsigned)g_afgRegN, vbInfo, lkInfo, dgInfo);
             g_afgRegN = g_afgRegSx = g_afgRegSy = g_afgRegSxx = g_afgRegSxy = 0.0;
+            if (g_ad.mulCap || g_ad.slotsStretch)
+                Log("FG adaptivni: cil %.1f FPS nad nejvyssim nasobkem: %s, slotu nahrazeno roztazenim %u",
+                    ps->adaptTargetMilli / 1000.0, g_ad.mulCap ? "ano (vystup = nejvyssi nasobek x skutecne)" : "ne", g_ad.slotsStretch);
         }
     }
-    g_ad.switches = g_ad.slots = g_ad.slotsReal = g_ad.slotsDrop = 0;
-    g_ad.Lacc = g_ad.snapErr = g_ad.contErr = g_ad.vbErr = FgAcc();
+    g_ad.switches = g_ad.slots = g_ad.slotsReal = g_ad.slotsDrop = g_ad.slotsStretch = 0;
+    g_ad.lockSlots = g_ad.lockLost = g_ad.lockStages = 0;
+    g_ad.Lacc = g_ad.snapErr = g_ad.contErr = g_ad.vbErr = g_ad.lockPh = FgAcc();
+    g_dg.pairs = g_dg.calls = g_dg.extra = g_dg.shifted = g_dg.dropped = 0;
+    g_dg.wJudged = g_dg.wSusp = g_dg.wCopy = g_dg.wStill = 0;
+    g_dg.tErr = g_dg.wTp = FgAcc();
     g_fgSt = {};
     g_fgStatQpc = now;
 }
 
 // Uplne uvolneni zdroju presentu (po zastaveni vlakna presentu nebo na konci). GPU musi jit uklidnit.
 static void FgFreeAll(const char* why) {
+    FgBusyScope busy;
     if (g_fgFreed) return;
     g_fgFreed = true;
     FgQuiesce();
@@ -3219,6 +3640,7 @@ static void FgFreeAll(const char* why) {
 // Proxy zada konec prezentace (zaloha) nebo presenter selhal: vlakno presentu uvolni swapchain, zdroje pryc.
 static void FgStop(const char* why) {
     if (g_fgDead) return;
+    FgBusyScope busy;
     g_fgDead = true;
     g_fgSnapWanted = false;
     Log("prezentace: konec (%s)", why);
@@ -3257,6 +3679,7 @@ static void FgStop(const char* why) {
 // prezentacni okno (gameHwnd), stop = 0, restartSeq + 1. Vlakno presentu zacne znovu (stare uz swapchain uvolnilo
 // a jen ceka), obrazy presentu prijdou v nove generaci. Hlavni vlakno.
 static void FgRestart(BmsdPresentShared* ps) {
+    FgBusyScope busy;
     g_fgRestartSeq = ps->restartSeq;
     {
         std::lock_guard<std::mutex> lk(g_fgMx);
@@ -3264,7 +3687,7 @@ static void FgRestart(BmsdPresentShared* ps) {
         g_fgCv.notify_all();
     }
     if (g_fgThread.joinable()) g_fgThread.join();
-    FgPtWaitCmds(2000000000ull);
+    FgPtWaitCmds(kGpuTimeoutNs);
     FgPtDestroySwapchain("znovu zapnuti");  // (po FgPtStop uz neni; pojistka)
     FgPtDestroySurface();
     {
@@ -3398,6 +3821,13 @@ static void FgInit(DWORD pid) {
     g_fgCfg.dumpFrames = std::max(0, std::min(64, num(L"DumpFrames", 0)));
     g_fgCfg.dumpAfter = std::max(0, num(L"DumpAfter", 300));
     g_fgCfg.dumpTrigger = num(L"DumpTrigger", 0);
+    {
+        const std::wstring t = IniStr(L"debug", L"SelfCheckTest", L"");
+        g_fgCfg.scTest = t.empty() ? 0 : (int)wcstol(t.c_str(), nullptr, 0);
+        if (g_fgCfg.scTest & 2)
+            Log("config [debug]: SelfCheckTest=%d - TEST: adaptivni rezimy se podle odhadu ceny generatoru nevypinaji",
+                g_fgCfg.scTest);
+    }
     g_fgCfg.sharpenGen = std::max(0.0f, std::min(1.0f, IniFloat(L"SharpenGen", 0.0f, L"fg")));
     g_fgCfg.dlssgLite = std::max(-1, std::min(1, num(L"DlssgLiteBlending", -1)));
     g_fgCfg.dlssgUir = num(L"DlssgUir", 0) ? 1 : 0;
@@ -3416,6 +3846,20 @@ static void FgInit(DWORD pid) {
         g_fgCfg.adaptSnapMs = std::max(0.0, std::min(3.0, _wtof(v.c_str())));
         if (g_fgCfg.adaptSnapMs > 0.0) Log("config [fg]: AdaptiveSnapMs=%.2f (rozvrh A: prichyceni na skutecny snimek)",
                                            g_fgCfg.adaptSnapMs);
+        g_fgCfg.adaptGpuDone = num(L"AdaptGpuDone", 1) != 0 ? 1 : 0;
+        const std::wstring mg = IniStr(L"fg", L"AdaptMarginMs", L"1.0");
+        g_fgCfg.adaptMarginMs = std::max(0.0, std::min(5.0, _wtof(mg.c_str())));
+        if (!g_fgCfg.adaptGpuDone || fabs(g_fgCfg.adaptMarginMs - 1.0) > 1e-6)
+            Log("config [fg]: AdaptGpuDone=%d, AdaptMarginMs=%.2f (rozvrh A: posun obsahu za zobrazenim)",
+                g_fgCfg.adaptGpuDone, g_fgCfg.adaptMarginMs);
+        g_fgCfg.dlssgSelect = num(L"DlssgSelect", 1) != 0 ? 1 : 0;
+        g_fgCfg.dlssgFareyMax = std::max(2, std::min(kFgMaxInterp, num(L"DlssgFareyMax", 5)));
+        g_fgCfg.dlssgWatch = std::max(0, std::min(2, num(L"DlssgWatch", 1)));
+        g_fgCfg.dlssgWatchLog = std::max(0, num(L"DebugDlssgWatchLog", 0));
+        g_fgCfg.dlssgBreak = num(L"DebugDlssgBreak", 0) != 0 ? 1 : 0;
+        if (!g_fgCfg.dlssgSelect || g_fgCfg.dlssgFareyMax != 5 || g_fgCfg.dlssgWatch != 1 || g_fgCfg.dlssgBreak)
+            Log("config [fg]: adaptivni DLSS-G DlssgSelect=%d, DlssgFareyMax=%d, DlssgWatch=%d%s", g_fgCfg.dlssgSelect,
+                g_fgCfg.dlssgFareyMax, g_fgCfg.dlssgWatch, g_fgCfg.dlssgBreak ? ", DebugDlssgBreak=1 (ladeni)" : "");
         g_fgCfg.vblankGrid = num(L"VblankGrid", 0) != 0;
         g_ptmDumpN = (size_t)std::max(0, std::min(20000, num(L"PresentTimingDump", 0)));
         if (g_ptmDumpN) {
@@ -3497,6 +3941,8 @@ static void FgInit(DWORD pid) {
 
 // Zprava "novy snimek" od proxy (event ..._pframe) nebo periodicke probuzeni. Hlavni vlakno.
 // ---------------------------------------------------------------------------------------------------------------
+// Adaptivni DLSS-G (dgM > 0) pouziva stejny rozvrh; casy mezisnimku se pak zaokrouhli na casy, ktere DLSS-G umi
+// (FgDgEncode), a sloty bliz skutecnemu snimku nez pul nejmensiho kroku ukazou ten snimek.
 // Adaptivni FSR: rozvrh (hlavni vlakno, jednou za skutecny snimek N). Casy jsou postQpc proxy (Present hry) = obsahovy
 // cas skutecneho snimku; t mezisnimku se pocita zpetne ze skutecnych casu (rN-1, rN), odhad dalsiho snimku netreba.
 //  A (pevny rytmus): mrizka slotu s periodou P = 1 / cil; slot zobrazeny v d ukazuje obsah c = d - L, t = (c - rN-1) /
@@ -3515,7 +3961,166 @@ struct FgAdaptPlan {
     bool showReal = true;
     LONGLONG disp[kFgMaxInterp] = {}, dispReal = 0;
     LONGLONG content[kFgMaxInterp + 1] = {};
+    // adaptivni DLSS-G: volani NGX tohoto paru v poradi zaznamu (posledni je uzaviraci), vystup do interp[img]
+    int nCalls = 0, nImg = 0;
+    struct {
+        uint8_t cnt, idx, img;
+    } call[kFgMaxInterp + 1] = {};
 };
+
+// Adaptivni DLSS-G: tabulka casu, ktere DLSS-G umi s MultiFrameCount <= M: k / (n + 1), 1 <= k <= n <= M, vzestupne.
+// Ke kazdemu casu neuzaviraci zapis (count ncN, index ncK < ncN; 0 = neni) a uzaviraci (count = index = clN; 0 = neni).
+struct FgDgFrac {
+    float t;
+    uint8_t ncN, ncK, clN;
+};
+static int FgDgTable(int M, const FgDgFrac** out) {
+    static FgDgFrac s_tab[kFgMaxInterp + 1][16];
+    static int s_n[kFgMaxInterp + 1];
+    M = std::max(1, std::min(kFgMaxInterp, M));
+    if (!s_n[M]) {
+        FgDgFrac* tab = s_tab[M];
+        int nt = 0;
+        for (int n = 1; n <= M; ++n)
+            for (int k = 1; k <= n; ++k) {
+                const float t = (float)k / (float)(n + 1);
+                int i = 0;
+                while (i < nt && fabsf(tab[i].t - t) > 1e-5f) ++i;
+                if (i == nt) tab[nt++] = {t, 0, 0, 0};
+                if (k == n) tab[i].clN = (uint8_t)n;
+                else if (!tab[i].ncN) tab[i].ncN = (uint8_t)n, tab[i].ncK = (uint8_t)k;  // nejmensi count
+            }
+        std::sort(tab, tab + nt, [](const FgDgFrac& a, const FgDgFrac& b) { return a.t < b.t; });
+        s_n[M] = nt;
+    }
+    *out = s_tab[M];
+    return s_n[M];
+}
+
+// Adaptivni DLSS-G: casy mezisnimku planu (pl.t, vzestupne) zaokrouhlit na casy DLSS-G a sestavit volani paru.
+//   select: jen potrebna volani - mezisnimky pred poslednim neuzaviracim zapisem (cas bez nej se posune na nejblizsi
+//           volny), posledni uzaviracim; kdyz ho nema, neuzaviracim + volani (1,1) navic (vystup se zahodi).
+//   jinak:  cela sekvence 1..C (C = M, v zamku q/p p - 1), zobrazi se jen potrebne vystupy.
+// Par bez mezisnimku = jedine volani (1,1). Mezisnimek, na ktery nezbyl cas, se nezobrazi (jen pri vystup / hra > ~5).
+static void FgDgEncode(FgAdaptPlan& pl, int M, bool select, int lockP, LONGLONG rN, LONGLONG rPrev, double I, bool addCont) {
+    const int maxImg = std::max(1, std::min(kFgMaxInterp, g_fgInterpN));  // obrazu interp na vystupni slot
+    const FgDgFrac* tab = nullptr;
+    const int nt = FgDgTable(M, &tab);
+    ++g_dg.pairs;
+    pl.nCalls = 0;
+    auto call = [&](int cnt, int idx, int img) {
+        pl.call[pl.nCalls].cnt = (uint8_t)cnt;
+        pl.call[pl.nCalls].idx = (uint8_t)idx;
+        pl.call[pl.nCalls].img = (uint8_t)img;
+        ++pl.nCalls;
+        pl.nImg = std::max(pl.nImg, img + 1);
+        ++g_dg.calls;
+    };
+    int src[kFgMaxInterp], m = 0, dropped = 0;
+    float tq[kFgMaxInterp];
+    if (!select) {
+        const int C = lockP >= 2 && lockP - 1 <= M ? lockP - 1 : M;
+        int ks[kFgMaxInterp], prev = 0;
+        for (int g = 0; g < pl.n; ++g) {
+            int k = (int)floor((double)pl.t[g] * (C + 1) + 0.5);
+            if (k <= prev) k = prev + 1;
+            if (k > C) {
+                ++dropped;
+                continue;
+            }
+            ks[m] = k;
+            src[m] = g;
+            tq[m] = (float)k / (float)(C + 1);
+            prev = k;
+            ++m;
+        }
+        if (!m) {
+            call(1, 1, 0);
+        } else {
+            int spare = m;
+            for (int idx = 1; idx <= C; ++idx) {
+                int q = 0;
+                while (q < m && ks[q] != idx) ++q;
+                call(C, idx, q < m ? q : spare++);
+            }
+        }
+    } else {
+        int f[kFgMaxInterp], prev = -1;
+        for (int g = 0; g < pl.n; ++g) {
+            int best = 0;
+            for (int i = 1; i < nt; ++i)
+                if (fabsf(tab[i].t - pl.t[g]) < fabsf(tab[best].t - pl.t[g])) best = i;
+            if (best <= prev) best = prev + 1;
+            if (best >= nt) {
+                ++dropped;
+                continue;
+            }
+            f[m] = best;
+            src[m] = g;
+            prev = best;
+            ++m;
+        }
+        // mezisnimky pred poslednim: jen neuzaviraci zapis
+        for (int q = 0; q + 1 < m; ++q) {
+            if (tab[f[q]].ncN) continue;
+            const float want = pl.t[src[q]];
+            int best = -1;
+            for (int i = q ? f[q - 1] + 1 : 0; i < f[q + 1]; ++i)
+                if (tab[i].ncN && (best < 0 || fabsf(tab[i].t - want) < fabsf(tab[best].t - want))) best = i;
+            if (best < 0) {  // zadny volny cas: mezisnimek vynechat
+                for (int r = q; r + 1 < m; ++r) f[r] = f[r + 1], src[r] = src[r + 1];
+                --m;
+                --q;
+                ++dropped;
+            } else {
+                f[q] = best;
+                ++g_dg.shifted;
+            }
+        }
+        bool extra = false;
+        while (m && !tab[f[m - 1]].clN && !g_fgCfg.dlssgBreak) {
+            if (m < maxImg) {  // volani (1,1) navic do volneho obrazu
+                extra = true;
+                break;
+            }
+            // na volani navic neni obraz: posledni na nejblizsi uzaviraci cas (jinak ho vynechat a zkusit predchozi)
+            const float want = pl.t[src[m - 1]];
+            int best = -1;
+            for (int i = m > 1 ? f[m - 2] + 1 : 0; i < nt; ++i)
+                if (tab[i].clN && (best < 0 || fabsf(tab[i].t - want) < fabsf(tab[best].t - want))) best = i;
+            if (best >= 0) {
+                f[m - 1] = best;
+                ++g_dg.shifted;
+                break;
+            }
+            --m;
+            ++dropped;
+        }
+        for (int q = 0; q < m; ++q) {
+            const FgDgFrac& e = tab[f[q]];
+            tq[q] = e.t;
+            const bool nc = e.ncN && (q + 1 < m || extra || !e.clN || g_fgCfg.dlssgBreak);
+            if (nc) call(e.ncN, e.ncK, q);
+            else call(e.clN, e.clN, q);
+        }
+        if (extra || !m) {
+            call(1, 1, m);
+            if (m) ++g_dg.extra;
+        }
+    }
+    for (int q = 0; q < m; ++q) {
+        const int g = src[q];
+        const double err = fabs((double)tq[q] - (double)pl.t[g]) * I;
+        g_dg.tErr.add(err);
+        if (addCont) g_ad.contErr.add(err);
+        pl.t[q] = tq[q];
+        pl.disp[q] = pl.disp[g];
+        pl.content[q] = rPrev + (LONGLONG)((double)tq[q] * (double)(rN - rPrev));
+    }
+    pl.n = m;
+    g_dg.dropped += (unsigned)dropped;
+    g_ad.slotsDrop += (unsigned)dropped;
+}
 
 static void FgAdaptReset(int pacing) {
     g_ad.active = false;
@@ -3527,11 +4132,21 @@ static void FgAdaptReset(int pacing) {
     g_ad.winStart = g_ad.activeSince = g_ad.blockUntil = 0;
     g_ad.lowGain = 0;
     g_ad.backoffS = 5.0;
+    g_ad.costSince = g_ad.costOffAt = g_ad.costBlockUntil = 0;
+    g_ad.costBackoffS = 5.0;
+    g_ad.reason = BMSD_ADR_NONE;
+    g_ad.lockOn = false;
+    g_ad.lockGood = 0;
+    g_ad.rHat = 0.0;
 }
 
+// dgM > 0: adaptivni DLSS-G s MultiFrameCount <= dgM (jinak adaptivni FSR); prevPaired: minuly snimek prosel generatorem.
 static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LONGLONG rN, LONGLONG rPrev, double dtMs,
-                                   bool ok, bool reset) {
+                                   bool ok, bool reset, int dgM, bool prevPaired) {
     FgAdaptPlan pl;
+    const bool dg = dgM > 0;
+    const int maxN = dg ? std::min(kFgMaxInterp, g_fgInterpN) : kAfgMaxInterp;
+    const char* const nm = dg ? "adaptivni DLSS-G" : "adaptivni FSR (A)";
     pl.content[kFgMaxInterp] = rN;
     const double qms = (double)g_qpf.QuadPart / 1000.0;  // QPC na ms
     double tgt = ps->adaptTargetMilli / 1000.0;
@@ -3547,12 +4162,31 @@ static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LO
     if (vb) P = vbR;
     const int pacing = 0;  // jen rozvrh A (rozvrh B odstranen ve v24z4: ve 4K skubal, nikde se neosvedcil)
     if (pacing != g_ad.lastPacing) FgAdaptReset(pacing);
-    if (dtMs >= 2.0 && dtMs <= 100.0) {
+    if (dtMs >= 0.5 && dtMs <= 100.0) {
         g_ad.ivEma = g_ad.ivEma > 0.0 ? g_ad.ivEma + 0.1 * (dtMs - g_ad.ivEma) : dtMs;
         g_ad.ivHist[g_ad.ivPos++ & 7] = dtMs;
     }
     const double realFps = g_ad.ivEma > 0.0 ? 1000.0 / g_ad.ivEma : 0.0;
-    const bool linked = !reset && g_afgPrevPaired && rN > rPrev;  // par navazuje na minuly (jinak jen par, bez mezisnimku)
+    // Cil, na ktery by bylo potreba vic nez (maxN + 1) obrazu na skutecny snimek (6x; v103h): mrizka se roztahne na
+    // presne (maxN + 1) slotu na interval skutecnych snimku (P = interval / (maxN + 1)) a casy obsahu jsou k / (maxN + 1)
+    // jako v zamku - vystup = 6 x skutecne, rovnomerne a bez vynechanych slotu. Driv se sloty navic zahazovaly.
+    const int maxMul = maxN + 1;
+    const double ivMul = g_ad.ivEma > 0.0 ? g_ad.ivEma / (double)maxMul : 0.0;
+    const bool mulCap = !vb && ivMul > (g_ad.mulCap ? 0.99 : 1.01) * P;
+    if (mulCap != g_ad.mulCap) {
+        g_ad.mulCap = mulCap;
+        static LONGLONG s_mcLogQ;
+        static unsigned s_mcN;
+        ++s_mcN;
+        if (!s_mcLogQ || now - s_mcLogQ > 10 * g_qpf.QuadPart) {
+            s_mcLogQ = now;
+            Log("FG: %s - %s (skutecne %.1f FPS, cil %.1f, vystup nejvys %.1f; prepnuti %u)", nm,
+                mulCap ? "cil je nad 6x skutecne FPS: vystup = nejvyssi nasobek x skutecne" : "cil je zase do nejvyssiho nasobku",
+                realFps, tgt, maxMul * realFps, s_mcN);
+        }
+    }
+    if (mulCap) P = std::max(P, ivMul);
+    const bool linked = !reset && prevPaired && rN > rPrev;  // par navazuje na minuly (jinak jen par, bez mezisnimku)
     const double I = rN > rPrev ? (double)(rN - rPrev) / qms : 0.0;
 
     if (pacing == 0) {
@@ -3590,20 +4224,40 @@ static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LO
             }
             if (g_ad.active && g_ad.lowGain >= 3) {
                 g_ad.active = false;
+                g_ad.reason = BMSD_ADR_USELESS;
                 g_ad.lowGain = 0;
                 ++g_ad.uselessOff;
                 g_ad.blockUntil = now + (LONGLONG)(g_ad.backoffS * (double)g_qpf.QuadPart);
-                Log("FG: adaptivni FSR (A) generovani snimky nepridava (zobrazeno %.2f na skutecny, skutecne %.1f FPS, "
+                Log("FG: %s generovani snimky nepridava (zobrazeno %.2f na skutecny, skutecne %.1f FPS, "
                     "cil %.1f) - jen skutecne, znovu nejdriv za %.0f s",
-                    g_ad.lastGain, realFps, tgt, g_ad.backoffS);
+                    nm, g_ad.lastGain, realFps, tgt, g_ad.backoffS);
                 g_ad.backoffS = std::min(60.0, g_ad.backoffS * 2.0);
             }
         }
-        if (!g_ad.active) {
+        // Preference ([fg] Preference, v103e; proxy src/fgpref.inl): rozhoduje proxy podle odhadu FPS hry bez generatoru
+        // a profilu hrace (adaptPref bit 0). Helper pak dolni / horni hranici ani svuj odhad ceny nepouziva, jen
+        // poslechne bit 1 (generovat / jen skutecne); kontrola uzitecnosti a jeji backoff (blockUntil) plati dal.
+        // Generator ani presenter se pri tom nerusi - jen GENERUJE <-> JEN SKUTECNE.
+        const uint32_t prefW = ps->adaptPref;
+        const bool prefOn = (prefW & 1u) != 0, prefGen = (prefW & 2u) != 0;
+        if (prefOn) {
+            g_ad.belowSince = g_ad.aboveSince = 0;
+            g_ad.costSince = 0;
+            if (!g_ad.active && prefGen && now >= g_ad.blockUntil) {
+                g_ad.active = true;
+                g_ad.reason = BMSD_ADR_PREF_ON;
+            } else if (g_ad.active && !prefGen) {
+                g_ad.active = false;
+                g_ad.reason = BMSD_ADR_PREF_OFF;
+            }
+        } else if (!g_ad.active) {
             g_ad.aboveSince = 0;
             if (realFps > 0.0 && realFps < lower && now >= g_ad.blockUntil) {
                 if (!g_ad.belowSince) g_ad.belowSince = now;
-                if (now - g_ad.belowSince >= half) g_ad.active = true;
+                if (now - g_ad.belowSince >= half) {
+                    g_ad.active = true;
+                    g_ad.reason = BMSD_ADR_BELOW;
+                }
             } else {
                 g_ad.belowSince = 0;
             }
@@ -3611,20 +4265,74 @@ static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LO
             g_ad.belowSince = 0;
             if (realFps > upper) {
                 if (!g_ad.aboveSince) g_ad.aboveSince = now;
-                if (now - g_ad.aboveSince >= half) g_ad.active = false;
+                if (now - g_ad.aboveSince >= half) {
+                    g_ad.active = false;
+                    g_ad.reason = BMSD_ADR_ABOVE;
+                }
             } else {
                 g_ad.aboveSince = 0;
             }
+            // Zbytecne generovani (v102s): odhad skutecnych FPS bez generatoru = interval skutecnych snimku minus cena
+            // generatoru na GPU. Se zamkem nebo stropem limiter spi, interval je delsi a odhad jen nizsi (opatrny).
+            // Hra s generatorem omezena CPU: odhad muze byt vyssi nez skutecnost - pak se generovani hned znovu zapne
+            // (pod dolni hranici) a dalsi vypnuti podle odhadu ceka 5 s, pri opakovani az 60 s.
+            const double capR = ps->adaptRealCap ? (double)ps->adaptRealCap : 0.0;
+            double est = g_ad.genMsEma > 0.0 && g_ad.ivEma > g_ad.genMsEma + 1.0 ? 1000.0 / (g_ad.ivEma - g_ad.genMsEma) : 0.0;
+            if (capR > 0.0 && est > capR) est = capR;
+            g_ad.costEst = est;
+            const bool ramped = g_ad.activeSince && now - g_ad.activeSince >= 2 * g_qpf.QuadPart;
+            // Rezerva 8 %: odhad ve hre vychazel o 8-13 % nad skutecnosti (generator ve hre omezene GPU zcasti vyplni
+            // mezery, kdy GPU ceka na hru; prehrada bm_c2a5a: hra bez FG 132 FPS, odhad 143-150). S vychozi dolni
+            // hranici (90 % cile) to chce odhad o > 14 % nad skutecnosti, nez se generovani vypne omylem. Se zamkem je
+            // odhad nizsi (limiter spi), proto ne vic: cil 128,7 a stupen 4/5 dal odhad 135,8 (hranice 132,1).
+            if (g_ad.active && ramped && est > 1.08 * upper && now >= g_ad.costBlockUntil && !prefOn) {
+                if (!g_ad.costSince) g_ad.costSince = now;
+                if (now - g_ad.costSince >= half && !(g_fgCfg.scTest & 2)) {
+                    g_ad.active = false;
+                    g_ad.reason = BMSD_ADR_COST;
+                    g_ad.costOffAt = now;
+                    ++g_ad.costOff;
+                    Log("FG: %s - hra by cil stihla i bez generovani (skutecne %.1f FPS, cena generatoru %.2f ms na skutecny "
+                        "snimek, odhad bez nej %.1f FPS, horni hranice %.1f)", nm, realFps, g_ad.genMsEma, est, upper);
+                }
+            } else {
+                g_ad.costSince = 0;
+            }
+            g_ad.scLimit = 1.08 * upper;
         }
+        g_ad.scOverMs = g_ad.active && g_ad.costSince ? (double)(now - g_ad.costSince) / qms : 0.0;
+        g_ad.scOverAt = now;
         if (was != g_ad.active) {
+            if (g_ad.active && g_ad.costOffAt) {  // znovu zapnuto po vypnuti podle odhadu ceny
+                const double offS = (double)(now - g_ad.costOffAt) / (double)g_qpf.QuadPart;
+                if (offS < 5.0) {
+                    g_ad.costBlockUntil = now + (LONGLONG)(g_ad.costBackoffS * (double)g_qpf.QuadPart);
+                    Log("FG: %s - odhad bez generovani nevysel (znovu za %.1f s), dalsi vypnuti podle odhadu nejdriv za %.0f s",
+                        nm, offS, g_ad.costBackoffS);
+                    g_ad.costBackoffS = std::min(60.0, g_ad.costBackoffS * 2.0);
+                } else if (offS >= 20.0) {
+                    g_ad.costBackoffS = 5.0;
+                }
+                g_ad.costOffAt = 0;
+            }
+            g_ad.costSince = 0;
             ++g_ad.switches;
             g_ad.nextDisp = 0;
             g_ad.activeSince = g_ad.active ? now : 0;
-            Log("FG: adaptivni FSR (A) %s - skutecne %.1f FPS, cil %.1f, hranice %.1f / %.1f", g_ad.active ? "generuje"
-                                                                                                      : "jen skutecne",
-                realFps, tgt, lower, upper);
+            if (prefOn && g_ad.reason != BMSD_ADR_USELESS)
+                Log("FG: %s %s - podle preference (proxy, duvod %u), skutecne %.1f FPS, cil %.1f", nm,
+                    g_ad.active ? "generuje" : "jen skutecne", (prefW >> 8) & 0xFFu, realFps, tgt);
+            else
+                Log("FG: %s %s - skutecne %.1f FPS, cil %.1f, hranice %.1f / %.1f", nm, g_ad.active ? "generuje" : "jen skutecne",
+                    realFps, tgt, lower, upper);
         }
         g_ad.engaged = g_ad.active;
+        if (!g_ad.active || !ok || !linked) {  // rozvrh nebezi: zamek se chyta znovu
+            if (g_ad.lockOn) ++g_ad.lockLost;
+            g_ad.lockOn = false;
+            g_ad.lockGood = 0;
+            g_ad.rHat = 0.0;
+        }
         if (!g_ad.active || !ok) {
             g_ad.nextDisp = 0;
             return pl;
@@ -3641,8 +4349,65 @@ static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LO
         const double late = g_adLateMs;
         g_adLateMs = 0.0;
         g_ad.lateBoost = std::max(g_ad.lateBoost * 0.995, late > 0.25 * P ? std::min(late, 20.0) : 0.0);
-        const double Lt = maxI + g_adDoneMs + 1.0 + g_ad.lateBoost;
+        // Nutny posun: slot s obsahem tesne za rN potrebuje dalsi par (rN+1 az za interval I) hotovy na GPU, tedy
+        // L >= I + hotovo. Prichyceni za snimkem (AdaptiveSnapMs) tyto sloty ukaze jako rN, takze o nej mene (nejvys
+        // P - snap: kdyz uz rN ukazal slot pred nim, nasledujici slot je od rN aspon P - snap a jde do dalsiho paru).
+        // Adaptivni DLSS-G: nejmensi cas mezisnimku je 1 / (M + 1), nejvetsi M / (M + 1); slot bliz skutecnemu snimku nez
+        // pul kroku (pred nim i za nim) ukaze ten snimek - prichyceni jako AdaptiveSnapMs, jen podle intervalu.
+        const double dgSnapT = dg ? 0.5 / (double)(dgM + 1) : 0.0;
+        const double snapLt = dg ? dgSnapT * (g_ad.ivEma > 0.0 ? std::min(g_ad.ivEma, I) : I) : g_fgCfg.adaptSnapMs;
+        const double snapAfter = std::min(snapLt, std::max(0.0, P - snapLt));
         const LONGLONG Pq = (LONGLONG)(P * qms);
+        // Zlomkovy zamek: proxy drzi skutecne snimky na cil * q / p, tedy interval Inom = P * p / q. Obsah slotu pak
+        // lezi vzdy na k / p intervalu (krok P / q): k = p je skutecny snimek (kazdy q-ty, podil 1 / p), ostatni
+        // mezisnimky s pevnym t = k / p. Casy skutecnych snimku se berou z vyhlazene rady (rHat: limiter budi hru v
+        // pravidelnem rytmu, cas Present kolisa o cas snimku), poloha se zaokrouhluje na nejblizsi k. Slot s obsahem
+        // tesne za snimkem (do pulky kroku) ukaze ten snimek, takze dalsi par je potreba az o krok pozdeji: L o P / q
+        // kratsi. Fazi (stred zaokrouhleni) dorovnava mrizka: krok slotu se meni nejvys o 2 % (prodlouzeni) a pod
+        // strop VRR se nezkrati. Mimo rytmus (zaskub, zmena stupne) bezi rozvrh jako bez zamku.
+        // (v103h) cil nad nejvyssim nasobkem: stupen 1 / (maxN + 1) s periodou z mereneho intervalu misto stupne limiteru
+        const uint32_t lkw = mulCap ? (uint32_t)maxMul | 1u << 8 : ps->adaptLock;
+        const int lp = (int)(lkw & 0xFFu), lq = (int)((lkw >> 8) & 0xFFu);
+        const bool lockReq = lp >= 2 && lp <= 16 && lq >= 1 && lq < lp && !vb && I > 0.0 && (!dg || lp <= dgM + 1);
+        if ((lockReq ? lp : 0) != g_ad.lockP || (lockReq ? lq : 0) != g_ad.lockQ) {
+            g_ad.lockP = lockReq ? lp : 0;
+            g_ad.lockQ = lockReq ? lq : 0;
+            g_ad.lockOn = false;
+            g_ad.lockGood = 0;
+            g_ad.rHat = 0.0;
+            ++g_ad.lockStages;
+        }
+        const double lkStep = lockReq ? P / lq : 0.0;  // ms: krok poloh obsahu = Inom / p
+        const double Inom = lockReq ? P * lp / lq : 0.0;
+        if (lockReq) {
+            const double pred = g_ad.rHat > 0.0 ? g_ad.rHat + Inom * qms : (double)rN;
+            const double dev = ((double)rN - pred) / qms;
+            const double tol = std::max(0.5, 0.15 * Inom);
+            const bool inTol = fabs(dev) <= tol && fabs(I - Inom) <= 2.0 * tol;
+            // Ojedinely pozdni snimek (limiter fazi drzi, dalsi snimek je zase na rytmu) zamek nepusti: dva v rade
+            // nebo odchylka nad pul intervalu (zaskub, limiter zacal novou fazi) ano.
+            if (g_ad.rHat > 0.0 && (inTol || (g_ad.lockOn && g_ad.lockMiss < 1 && fabs(dev) <= 0.5 * Inom))) {
+                g_ad.rHat = pred + 0.1 * std::max(-tol, std::min(tol, dev)) * qms;
+                if (inTol) {
+                    g_ad.lockMiss = 0;
+                    if (g_ad.lockGood < 1000000) ++g_ad.lockGood;
+                } else {
+                    ++g_ad.lockMiss;
+                }
+            } else {
+                if (g_ad.lockOn) ++g_ad.lockLost;
+                g_ad.lockOn = false;
+                g_ad.lockGood = g_ad.lockMiss = 0;
+                g_ad.rHat = (double)rN;
+            }
+            if (!g_ad.lockOn && g_ad.lockGood >= std::max(12, (int)(250.0 / Inom))) g_ad.lockOn = true;
+        }
+        const bool lock = lockReq && g_ad.lockOn;
+        const double rHatPrev = g_ad.rHat - Inom * qms;
+        const double lkShrink = std::max(0.0, std::min(0.005 * P, 0.5 * (P - minIv)));  // zkraceni kroku slotu (ms)
+        const double lkStretch = 0.02 * P;                                              // prodlouzeni kroku slotu (ms)
+        const double lkDown = std::max(0.5 * lkShrink, 0.002 * P);  // pokles L za slot v zamku (faze ho musi stihat)
+        const double Lt = maxI - (lock ? lkStep : snapAfter) + g_adDoneMs + g_fgCfg.adaptMarginMs + g_ad.lateBoost;
         if (vb) g_ptCapOverrideQ = Pq - (LONGLONG)(0.02 * qms);  // nikdy blize nez perioda obnovy (- 0.02 ms kolisani)
         if (g_ad.nextDisp && now - g_ad.nextDisp > 3 * Pq) g_ad.nextDisp = 0;  // mrizka daleko v minulosti: znovu
         if (!g_ad.nextDisp) {
@@ -3670,13 +4435,57 @@ static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LO
             g_ad.vbErr.add(fabs((double)e / qms));
         }
         const double snap = g_fgCfg.adaptSnapPct / 100.0;
-        const double snapMs = g_fgCfg.adaptSnapMs;
+        const double snapMs = dg ? dgSnapT * I : g_fgCfg.adaptSnapMs;
         pl.fixedTimes = true;
         pl.periodMs = P;
         pl.showReal = false;
         int n = 0;
+        // Bez zamku: vic slotu na par, nez je obrazu (skutecny snimek se proti prumeru protahl, hra se prave zpomalila):
+        // sloty tohoto paru rozlozit rovnomerne, ne nechat diru na konci (v103h)
+        LONGLONG Psq = Pq;
+        if (!lock && !vb) {
+            const double span = (double)(rN - (g_ad.nextDisp - (LONGLONG)(g_ad.L * qms))) / qms + snapMs;
+            const int want = span >= 0.0 ? (int)floor(span / P) + 1 : 0;
+            if (want > maxMul && want <= 4 * maxMul) {
+                Psq = (LONGLONG)((double)Pq * (double)want / (double)maxMul);
+                g_ad.slotsStretch += (unsigned)(want - maxMul);
+            }
+        }
         for (int guard = 0; guard < 64; ++guard) {
             const LONGLONG c = g_ad.nextDisp - (LONGLONG)(g_ad.L * qms);
+            if (lock) {
+                const double x = ((double)c - rHatPrev) / (lkStep * qms);  // poloha obsahu v krocich 1 / p od rN-1
+                int kq = (int)floor(x + 0.5);
+                if (kq > lp || (kq == lp && pl.showReal)) break;  // patri dalsimu paru
+                LONGLONG adj = 0;
+                if (kq >= 1) {
+                    const double ph = (x - (double)kq) * lkStep;  // > 0: obsah pred polohou -> slot zobrazit drive
+                    g_ad.lockPh.add(ph);
+                    adj = -(LONGLONG)(std::max(-lkStretch, std::min(lkShrink, 0.1 * ph)) * qms);
+                } else {
+                    kq = 1;  // jen pri chytani zamku: slot pred prvni polohou
+                }
+                if (kq == lp) {
+                    pl.showReal = true;
+                    pl.dispReal = g_ad.nextDisp;
+                    ++g_ad.slotsReal;
+                    g_ad.contErr.add(fabs((double)rN - g_ad.rHat) / qms);
+                } else if (n < maxN) {
+                    pl.t[n] = (float)kq / (float)lp;
+                    pl.disp[n] = g_ad.nextDisp;
+                    pl.content[n] = (LONGLONG)(rHatPrev + (double)kq * lkStep * qms);
+                    g_ad.contErr.add(0.0);
+                    ++n;
+                } else {
+                    ++g_ad.slotsDrop;
+                }
+                ++g_ad.slots;
+                ++g_ad.lockSlots;
+                g_ad.nextDisp += Pq + adj;
+                const double dL = Lt - g_ad.L;
+                g_ad.L += dL > 0.0 ? std::min(dL, 0.1 * P) : std::max(dL, -lkDown);
+                continue;
+            }
             if (c > rN) {
                 // A+ (AdaptiveSnapMs): slot s obsahem nejvys snapMs za skutecnym snimkem ukaze ten skutecny snimek
                 // (jinak by ho dalsi par ukazal jako mezisnimek s t blizko 0)
@@ -3688,7 +4497,7 @@ static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LO
                     g_ad.snapErr.add(after);
                     g_ad.contErr.add(after);
                     ++g_ad.slots;
-                    g_ad.nextDisp += Pq + vbCorr;
+                    g_ad.nextDisp += Psq + vbCorr;
                     const double dL = Lt - g_ad.L;
                     g_ad.L += dL > 0.0 ? std::min(dL, 0.1 * P) : std::max(dL, -0.02 * P);
                     continue;
@@ -3705,23 +4514,24 @@ static FgAdaptPlan FgAdaptMakePlan(const BmsdPresentShared* ps, LONGLONG now, LO
                     if (snapMs > 0.0) g_ad.snapErr.add(before);
                     g_ad.contErr.add(before);
                 }
-            } else if (n < kAfgMaxInterp) {
+            } else if (n < maxN) {
                 if (t < 0.02) t = 0.02;
                 pl.t[n] = (float)t;
                 pl.disp[n] = g_ad.nextDisp;
                 pl.content[n] = c;
-                g_ad.contErr.add(t < 0.02 ? (0.02 - t) * I : 0.0);
+                if (!dg) g_ad.contErr.add(t < 0.02 ? (0.02 - t) * I : 0.0);  // (DLSS-G: chybu zaokrouhleni pocita FgDgEncode)
                 ++n;
             } else {
-                ++g_ad.slotsDrop;  // skutecne pod cil / 5: vic slotu na par, nez je obrazu
+                ++g_ad.slotsDrop;  // skutecne pod cil / 6: vic slotu na par, nez je obrazu
             }
             ++g_ad.slots;
-            g_ad.nextDisp += Pq + vbCorr;
+            g_ad.nextDisp += Psq + vbCorr;
             const double dL = Lt - g_ad.L;
             g_ad.L += dL > 0.0 ? std::min(dL, 0.1 * P) : std::max(dL, -0.02 * P);
         }
         g_ad.Lacc.add(g_ad.L);
         pl.n = n;
+        if (dg) FgDgEncode(pl, dgM, g_fgCfg.dlssgSelect && !g_dg.selectOff, lock ? lp : 0, rN, rPrev, I, !lock);
         return pl;
     }
 
@@ -3771,7 +4581,9 @@ static void FgOnPresentMsg(LONGLONG tWake) {
     // FG zap za behu: proxy chce prezentaci znovu (restartSeq). Proxy ceka na konec jen 1 s - kdyz hlavni vlakno
     // helperu v te dobe stalo (vytvareni generatoru, import), muze uz byt stop zase 0 s novym restartSeq, aniz helper
     // stop videl, nebo prezentace mezitim skoncila na znicenem okne. Obe varianty = konec a novy start.
-    if (ps && (!g_fgDead || g_fgStopByProxy || g_fgWndGone)) {
+    // Od v103c i po vlastni chybe presenteru (g_ptFailed, import; napr. GPU nedobehla na pomalem PC): proxy po zaloze
+    // zkusi novy start s rostoucim odstupem (omezeny pocet pokusu), skutecna chyba pak jen znovu selze.
+    if (ps) {
         MemoryBarrier();
         if (!ps->stop && ps->restartSeq != g_fgRestartSeq) {
             if (!g_fgDead) {
@@ -3789,10 +4601,8 @@ static void FgOnPresentMsg(LONGLONG tWake) {
     }
     if (g_ptFailed) return FgStop("chyba presenteru");
     FgPublishStats(tWake);
-    {  // nejkratsi interval presentu (strop VRR / limiter ovladace) z frekvence monitoru od proxy - pro vsechny rezimy
-        const double hz = ps->refreshMilli / 1000.0;
-        g_ptMinIvQ = hz >= 30.0 ? (LONGLONG)((double)g_qpf.QuadPart / (hz - hz * hz / 3600.0)) : 0;
-    }
+    // nejkratsi interval presentu od proxy (strop VRR, u rucniho cile nad nim jen pojistka) - pro vsechny rezimy
+    g_ptMinIvQ = ps->outCapMilli ? (LONGLONG)((double)g_qpf.QuadPart * 1000.0 / (double)ps->outCapMilli) : 0;
     if (ps->generation != g_fgGen && ps->generation != 0) {
         if (!FgImport()) return FgStop("import obrazu");
     }
@@ -3834,8 +4644,8 @@ static void FgOnPresentMsg(LONGLONG tWake) {
     if (consecutive && g_fgLastPostQpc) {
         const double dt = FgMs(g_fgLastPostQpc, posted);
         realDtMs = dt;
-        if (dt >= 2.0 && dt <= 100.0) {
-            const double c = std::min(50.0, std::max(4.0, dt));
+        if (dt >= 0.5 && dt <= 100.0) {
+            const double c = std::min(50.0, std::max(1.0, dt));  // v103h: i nad 250 skutecnych FPS (driv nejmene 4 ms)
             g_fgIntervalMs += 0.2 * (c - g_fgIntervalMs);
         }
     }
@@ -3847,9 +4657,11 @@ static void FgOnPresentMsg(LONGLONG tWake) {
 
     // Co s timto snimkem
     const uint32_t reqMode = ps->fgMode;
-    const bool want = reqMode == BMSD_FG_DLSSG || reqMode == BMSD_FG_FSR2X || reqMode == BMSD_FG_FSRADAPT;
+    const bool want = reqMode == BMSD_FG_DLSSG || reqMode == BMSD_FG_FSR2X || reqMode == BMSD_FG_FSRADAPT ||
+                      reqMode == BMSD_FG_DLSSGADAPT;
     const bool fsrGen = reqMode == BMSD_FG_FSR2X;
-    const bool adapt = reqMode == BMSD_FG_FSRADAPT;
+    const bool dgAdapt = reqMode == BMSD_FG_DLSSGADAPT;         // adaptivni DLSS-G (rozvrh A, generator DLSS-G)
+    const bool adapt = reqMode == BMSD_FG_FSRADAPT || dgAdapt;  // rozvrh A
     // Nasobek: pozadavek proxy ([fg] Multiplier / menu, 2..4); FSR FG umi jen 2x, DLSS-G podle GPU (MultiFrameCountMax)
     // a poctu obrazu interp. nGen = generovanych snimku na skutecny.
     uint32_t reqMult = ps->fgMultiplier & 0xFF;
@@ -3859,8 +4671,9 @@ static void FgOnPresentMsg(LONGLONG tWake) {
     // rozvrh jako DLSS-G. S auto i 2x pres AFG (zmena generatoru = nova feature = zaseknuti pri kazde zmene nasobku).
     // Kdyz AFG selze (g_fgFailedM[FSRADAPT]), FSR zustava na FSR FG 2x od AMD.
     const bool fsrMulti = fsrGen && (reqMult >= 3 || reqAuto) && g_afgAvail && !g_fgFailedM[BMSD_FG_FSRADAPT];
-    const bool afg = adapt || fsrMulti;                                         // generator AFG
-    const uint32_t genMode = fsrMulti ? (uint32_t)BMSD_FG_FSRADAPT : reqMode;  // feature, ktera generuje
+    const bool afg = (adapt && !dgAdapt) || fsrMulti;                           // generator AFG
+    // feature, ktera generuje
+    const uint32_t genMode = fsrMulti ? (uint32_t)BMSD_FG_FSRADAPT : dgAdapt ? (uint32_t)BMSD_FG_DLSSG : reqMode;
     // Vyssi nasobek DLSS-G, nez na kolik jsou vystupni obrazy: doplnit (jednou za generaci; kdyz to selze, zustava
     // nizsi nasobek jako drive pri malem poctu obrazu)
     if (reqMode == BMSD_FG_DLSSG && !g_fgFailedM[reqMode] && g_fgGrowFailGen != g_fgGen) {
@@ -3870,14 +4683,32 @@ static void FgOnPresentMsg(LONGLONG tWake) {
             Log("FG: obrazy pro nasobek %ux nejdou vytvorit (VRAM?) - DLSS-G zustava na %dx", reqMult, g_fgInterpN + 1);
         }
     }
+    // Adaptivni DLSS-G: obrazy pro az 5 volani na par; verze knihovny do logu (vyber volani je overeny jen na 310.9.x)
+    if (dgAdapt && FgAvailFor(reqMode) && !g_fgFailedM[genMode]) {
+        if (g_fgGrowFailGen != g_fgGen && g_fgInterpN < kFgMaxInterp && !FgGrowInterp(kFgMaxInterp, "adaptivni DLSS-G")) {
+            g_fgGrowFailGen = g_fgGen;
+            Log("FG: obrazy pro adaptivni DLSS-G nejdou vytvorit (VRAM?) - nejvys %d volani na par", g_fgInterpN);
+        }
+        if (g_dlssg && !g_dg.verLogged) {
+            g_dg.verLogged = true;
+            const bool known = g_fgDlssgVersion.compare(0, 6, "310.9.") == 0;
+            Log("FG: adaptivni DLSS-G - knihovna DLSS-G %s%s, MultiFrameCount az %d, %s, hlidani za behu %s",
+                g_fgDlssgVersion.empty() ? "(verze nezjistena)" : g_fgDlssgVersion.c_str(),
+                known ? "" : " - POZOR: vyber volani je overeny jen na 310.9.x, rozhodne hlidani za behu",
+                FgDgMaxCount(), g_fgCfg.dlssgSelect ? "vyber volani (DlssgSelect=1)" : "cela sekvence (DlssgSelect=0)",
+                g_fgCfg.dlssgWatch ? "zapnuto" : "VYPNUTO (DlssgWatch=0)");
+        }
+    }
+    const int dgM = dgAdapt ? std::min(FgDgMaxCount(), g_fgInterpN) : 0;
     const int mult = fsrMulti ? std::min((int)reqMult, kAfgMaxInterp + 1)
                      : fsrGen || adapt ? 2
                                : std::min((int)reqMult, std::min(g_fgMultMax, g_fgInterpN + 1));
     int nGen = mult - 1;  // adaptivni: podle rozvrhu (nize)
     if (want) g_fgCurMode = genMode;
-    if (want && !g_fgFailedM[genMode] && FgAvailFor(genMode)) FgEnsureFeature(genMode);  // i prepnuti DLSS-G <-> FSR
+    const bool modeOk = !dgAdapt || FgAvailFor(reqMode);  // adaptivni DLSS-G jen na GPU s DLSS-G nad 2x
+    if (want && modeOk && !g_fgFailedM[genMode] && FgAvailFor(genMode)) FgEnsureFeature(genMode);  // i prepnuti DLSS-G <-> FSR
     // generator pozadovaneho rezimu existuje a neselhal
-    const bool have = want && FgHave(genMode) && !g_fgFailedM[genMode];
+    const bool have = want && modeOk && FgHave(genMode) && !g_fgFailedM[genMode];
     if (!want && g_fgSnapWanted) g_fgSnapWanted = false;  // FG vypnuto v menu: snapshoty netreba
     // (Snapshot i v mrtve zone adaptivniho FSR: bez nej by snimek nemel MV, stav by presel na "pozastaveno" a rozvrh
     // by se znovu nezapnul - overeno 2026-11-20. Usetri se jen kopie HUD-less v proxy, [fg] AdaptIdleSkip.)
@@ -3889,7 +4720,7 @@ static void FgOnPresentMsg(LONGLONG tWake) {
         if (c.valid && c.B == B && g_fgPresView[k]) sn = &c;
     }
     // (FSR FG bere sub-rect renderu vzdy - PrepareV2::renderSize)
-    const bool subOk = !sn || fsrGen || adapt || g_fgCfg.dynRes || (sn->rW == g_w && sn->rH == g_h);
+    const bool subOk = !sn || fsrGen || (adapt && !dgAdapt) || g_fgCfg.dynRes || (sn->rW == g_w && sn->rH == g_h);
     bool gen = sn && subOk && !ps->fgPause && windowOk;
     bool reset = false;
     // FSR FG: po zaseknuti hry (interval skutecnych snimku aspon 3x delsi nez obvykly a nad 40 ms) se mezisnimek
@@ -3901,10 +4732,20 @@ static void FgOnPresentMsg(LONGLONG tWake) {
     const bool adaptRunning = adapt && gen;
     FgAdaptPlan apl;
     if (!adapt) g_ptCapOverrideQ = 0;
-    if (adapt) {
-        apl = FgAdaptMakePlan(ps, tWake, posted, prevPosted, consecutive ? realDtMs : 0.0, gen, reset);
+    if (adapt && !modeOk) {  // adaptivni DLSS-G na GPU bez DLSS-G nad 2x: jen skutecne snimky (proxy prejde na nahradni rezim)
+        gen = false;
+        nGen = 0;
+    } else if (adapt) {
+        // (DLSS-G: snimek bez vyhodnoceni znamena g_fgFresh -> reset, takze "minuly snimek prosel" plati vzdy, kdyz neni reset)
+        apl = FgAdaptMakePlan(ps, tWake, posted, prevPosted, consecutive ? realDtMs : 0.0, gen && (!dgAdapt || dgM >= 2),
+                              reset, dgAdapt ? std::max(dgM, 2) : 0, dgAdapt ? true : g_afgPrevPaired);
         if (!apl.pair) gen = false;
         nGen = apl.n;
+        if (dgAdapt && apl.pair && !apl.nCalls) {  // par bez rozvrhu (reset, nenavazuje): jedine volani, vystup se zahodi
+            apl.nCalls = apl.nImg = 1;
+            apl.call[0].cnt = apl.call[0].idx = 1;
+            apl.call[0].img = 0;
+        }
     } else if (fsrMulti) {  // pevny nasobek: par vzdy, mezisnimky jen kdyz par navazuje na minuly
         apl.pair = true;
         apl.n = gen && !reset && g_afgPrevPaired ? mult - 1 : 0;
@@ -3953,8 +4794,17 @@ static void FgOnPresentMsg(LONGLONG tWake) {
         vk.vkResetFences(g_dev, 1, &g_fgFence[c]);
         g_fgFenceUsed[c] = false;
         FgCollectTs(c);
+        FgDgWatchCollect(c, tWake);
     }
     if (j < 0) gen = false;
+    // Adaptivni DLSS-G, hlidani: miniatury jen z casti paru (~25 za sekundu): 1 = jen skutecny snimek (minuly pro dalsi
+    // par), 2 = skutecny + mezisnimky. Obrazy miniatur vznikaji pri prvnim pouziti.
+    int dwSample = 0;
+    if (dgAdapt && gen && g_fgCfg.dlssgWatch && apl.pair && FgDgWatchCreate()) {
+        const unsigned K = (unsigned)std::max(1, std::min(8, (int)(1000.0 / std::max(4.0, g_fgIntervalMs) / 25.0)));
+        const unsigned ph = g_dw.ctr++ % K;
+        dwSample = K == 1 || ph == 1 ? 2 : ph == 0 ? 1 : 0;
+    }
     // FSR FG: prikazy minuleho snimku s FSR FG musi na GPU dobehnout driv, nez se zaznamenava dalsi - ffx pri zaznamu
     // rusi sve pohledy na MV a hloubku minuleho snimku (tools/spike_ffg). Bezne uz davno dobehly (snimek stary ~13 ms);
     // fence se tu jen ceka, vynuluje se az pri pristim pouziti slotu.
@@ -3998,7 +4848,8 @@ static void FgOnPresentMsg(LONGLONG tWake) {
             uint32_t np = 0;
             pre[np++] = IB(g_fgPres[k].img, COLOR, 0, VK_ACCESS_SHADER_READ_BIT, GEN, SRO);
             pre[np++] = IB(g_fgOut[j].real.img, COLOR, 0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, GEN, GEN);
-            for (int g = 0; g < nGen; ++g)
+            const int nPre = dgAdapt ? std::max(nGen, apl.nImg) : nGen;  // adaptivni DLSS-G: i obrazy zahozenych volani
+            for (int g = 0; g < nPre; ++g)
                 pre[np++] = IB(g_fgOut[j].interp[g].img, COLOR, 0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                GEN, GEN);
             if (hl) pre[np++] = IB(g_fgHl[k].img, COLOR, 0, VK_ACCESS_SHADER_READ_BIT, GEN, SRO);
@@ -4032,7 +4883,30 @@ static void FgOnPresentMsg(LONGLONG tWake) {
                 // nasobek > 2: nGen vyhodnoceni za sebou (idx 1..nGen) do jednoho command bufferu
                 NVSDK_NGX_Result er = NVSDK_NGX_Result_Success;
                 if (g_uaOk && FgHlGen()) FgUiaRecord(cmd, k, hl, *sn);  // maska UI (DlssgUiAlpha) + zbran (v25w)
-                for (int g = 1; g <= nGen && NVSDK_NGX_SUCCEED(er); ++g)
+                if (dgAdapt) {  // volani podle planu (posledni je uzaviraci); reset jen u jedineho volani (1,1)
+                    for (int q = 0; q < apl.nCalls && NVSDK_NGX_SUCCEED(er); ++q)
+                        er = FgRecordDlssg(cmd, k, j, *sn, reset, hl && FgHlGen(), apl.call[q].idx, apl.call[q].cnt,
+                                           apl.call[q].img);
+                    // hlidani: miniatury skutecneho snimku ("real" od NGX) a zobrazenych mezisnimku
+                    g_dw.pend[c].used = false;
+                    if (reset || !apl.fixedTimes) g_dw.holdoff = 30;  // zacatek generovani / reset: chvili nesoudit
+                    else if (g_dw.holdoff > 0) --g_dw.holdoff;
+                    if (NVSDK_NGX_SUCCEED(er) && dwSample) {
+                        const int nW = dwSample == 2 && !reset && !g_dw.holdoff ? nGen : 0;
+                        FgDgWatchDown(cmd, g_fgOut[j].real.img, c, 0);
+                        for (int g = 0; g < nW; ++g) FgDgWatchDown(cmd, g_fgOut[j].interp[g].img, c, g + 1);
+                        g_dw.pend[c].used = true;
+                        g_dw.pend[c].N = N;
+                        g_dw.pend[c].nG = nW;
+                        for (int g = 0; g < nW; ++g) g_dw.pend[c].t[g] = apl.t[g];
+                        g_dw.pend[c].calls[0] = 0;
+                        for (int q = 0; q < apl.nCalls && g_fgCfg.dlssgWatchLog > 0; ++q)
+                            snprintf(g_dw.pend[c].calls + strlen(g_dw.pend[c].calls),
+                                     sizeof g_dw.pend[c].calls - strlen(g_dw.pend[c].calls), " (%d,%d)", apl.call[q].cnt,
+                                     apl.call[q].idx);
+                    }
+                }
+                for (int g = 1; g <= nGen && !dgAdapt && NVSDK_NGX_SUCCEED(er); ++g)
                     er = FgRecordDlssg(cmd, k, j, *sn, reset, hl && FgHlGen(), g, nGen);
                 if (NVSDK_NGX_FAILED(er)) {
                     // cmd buffer je v neznamem stavu: zahodit a snimek poslat jen jako kopii
@@ -4049,14 +4923,16 @@ static void FgOnPresentMsg(LONGLONG tWake) {
             if (ts) {
                 vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_fgQpool, c * 2 + 1);
                 g_fgTsUsed[c] = true;
-                g_fgTsGen[c] = adapt ? apl.n : -1;
+                g_fgTsGen[c] = dgAdapt ? apl.nCalls : adapt ? apl.n : -1;  // regrese: par + mezisnimky (DLSS-G: + volani)
+                g_fgTsMode[c] = dgAdapt ? (uint32_t)BMSD_FG_DLSSGADAPT : (uint32_t)BMSD_FG_FSRADAPT;
             }
             VkImageMemoryBarrier post[2] = {
                 IB(g_fgPres[k].img, COLOR, VK_ACCESS_SHADER_READ_BIT, 0, SRO, GEN),
                 hl ? IB(g_fgHl[k].img, COLOR, VK_ACCESS_SHADER_READ_BIT, 0, SRO, GEN) : VkImageMemoryBarrier{}};
             PB(cmd, ALL, ALL, hl ? 2 : 1, post);
             if (hl && FgHlGen()) ++g_fgSt.hudless;
-            if (fsrGen || adapt) {  // FSR si skutecny snimek nevyrabi: kopie backbufferu do "real" (jako bez generatoru)
+            // FSR si skutecny snimek nevyrabi: kopie backbufferu do "real" (jako bez generatoru); DLSS-G ho kopiruje sam
+            if (fsrGen || (adapt && !dgAdapt)) {
                 VkImageMemoryBarrier rb = IB(g_fgOut[j].real.img, COLOR, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                              VK_ACCESS_TRANSFER_WRITE_BIT, GEN, GEN);
                 PB(cmd, ALL, VK_PIPELINE_STAGE_TRANSFER_BIT, 1, &rb);
@@ -4179,9 +5055,11 @@ static void FgOnPresentMsg(LONGLONG tWake) {
         const bool unimpl = reqMode != BMSD_FG_OFF;
         FgPublishState(unimpl ? BMSD_FGS_UNAVAILABLE : BMSD_FGS_OFF, 0, unimpl ? "tento rezim zatim neni implementovan" : "");
     } else if (!FgAvailFor(reqMode)) {
-        FgPublishState(BMSD_FGS_UNAVAILABLE, 0, (fsrGen ? g_ffgAvailWhy : g_fgAvailWhy).c_str());
-    } else if (g_fgFailedM[reqMode]) {
-        FgPublishState(BMSD_FGS_FAILED, 0, g_fgFailWhyM[reqMode].c_str());
+        FgPublishState(BMSD_FGS_UNAVAILABLE, 0,
+                       dgAdapt && g_fgAvail ? "DLSS-G adaptivni potrebuje GPU s DLSS-G nad 2x (RTX 50) - pouzij FSR adaptivni"
+                                            : (fsrGen ? g_ffgAvailWhy : g_fgAvailWhy).c_str());
+    } else if (g_fgFailedM[genMode == BMSD_FG_DLSSG ? genMode : reqMode]) {
+        FgPublishState(BMSD_FGS_FAILED, 0, g_fgFailWhyM[genMode == BMSD_FG_DLSSG ? genMode : reqMode].c_str());
     } else if (showInterp || adaptRunning) {
         // adaptivni FSR bezi i v mrtve zone (jen skutecne snimky) - pro proxy stale ACTIVE (limiter na cil / strop)
         g_fgActMult = mult;
@@ -4228,9 +5106,15 @@ static void FgOnPresentMsg(LONGLONG tWake) {
                 (unsigned long long)B, mult, ok ? "ulozen (fgdump_NN_interp*.bmp / _real.bmp vedle helperu)" : "SELHAL",
                 prevOk ? " + _prev.bmp (minuly skutecny snimek)" : "", hlDump ? " + _hudless.bmp" : hl ? "" : " (bez HUD-less)");
             if (adapt) {
-                char ts[96] = "";
+                char ts[160] = "";
                 for (int g = 0; g < nGen; ++g) snprintf(ts + strlen(ts), sizeof ts - strlen(ts), " %.4f", apl.t[g]);
-                Log("FG: dump %d adaptivni FSR rozvrh %s, t =%s", g_fgDumpIdx, apl.fixedTimes ? "A" : "B", ts);
+                if (dgAdapt) {
+                    snprintf(ts + strlen(ts), sizeof ts - strlen(ts), " | volani");
+                    for (int q = 0; q < apl.nCalls; ++q)
+                        snprintf(ts + strlen(ts), sizeof ts - strlen(ts), " (%d,%d)", apl.call[q].cnt, apl.call[q].idx);
+                }
+                Log("FG: dump %d %s rozvrh %s, t =%s", g_fgDumpIdx, dgAdapt ? "adaptivni DLSS-G" : "adaptivni FSR",
+                    apl.fixedTimes ? "A" : "B", ts);
             }
             ++g_fgDumpIdx;
             --g_fgDumpLeft;

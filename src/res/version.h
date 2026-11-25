@@ -3,12 +3,12 @@
 #pragma once
 
 #define BMSDLSS_VER_MAJOR 1
-#define BMSDLSS_VER_MINOR 0
-#define BMSDLSS_VER_PATCH 1
+#define BMSDLSS_VER_MINOR 1
+#define BMSDLSS_VER_PATCH 0
 #define BMSDLSS_VER_BUILD 0
 
 // Retezcova podoba musi odpovidat cislum vyse (pack.ps1 cte BMSDLSS_VER_STR)
-#define BMSDLSS_VER_STR "1.0.1"
+#define BMSDLSS_VER_STR "1.1.0"
 
 #define BMSDLSS_PRODUCT   "bms-dlss"
 #define BMSDLSS_COMPANY   "Crashdown"

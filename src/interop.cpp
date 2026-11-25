@@ -124,6 +124,8 @@ bool g_helperStarted;
 int32_t g_generation;
 volatile uint32_t g_mode;
 unsigned g_timeouts, g_okFrames;
+ULONGLONG g_ackStallSince;  // od kdy helper nepotvrzuje (0 = potvrzuje), viz kAckStallMaxMs
+ULONGLONG g_ackStallLog;    // posledni radek "helper jeste neprevzal" (log nejvys 1x za s)
 bool g_loggedImages;
 uint64_t g_lastBridgedFrame;
 bool g_haveBridgedFrame;
@@ -191,12 +193,19 @@ volatile LONG g_aborted;    // strazce helper ukoncil a semHelper uvolnil z CPU 
 bool g_helperStopped;       // StopBridge: helper uz ukoncen (most trvale vypnuty)
 HANDLE g_watchThread;
 // Helper nepotvrdil snimek, na ktery uz GPU ceka: limit, pak ho strazce ukonci. Pokryva i pomalou obnovu DLSS feature
-// v helperu (fallback z S > 1, stovky ms) a je stejny jako limit vlastnich cekani helperu na GPU (5 s).
-const DWORD kPendingTimeoutMs = 5000;
+// v helperu (fallback z S > 1, stovky ms). Na pomalem PC (strankovani VRAM pri nacitani, antivir) smi helper stat
+// i sekundy: po kPendingWarnMs jen zalogovat, ukoncit az po kPendingTimeoutMs - delsi nez vlastni limit cekani helperu
+// na GPU (20 s), aby skutecnou chybu nahlasil helper sam. Mrtvy helper = hned.
+const DWORD kPendingWarnMs = 5000;
+const DWORD kPendingTimeoutMs = 30000;
 // Na zacatku konce sceny hra ceka na potvrzeni predchoziho snimku nejvys tolik (pak snimek vynecha, jako drive).
 const DWORD kAckWaitMs = 100;
-// Helper hlasi dlouhou praci hlavniho vlakna (helperBusyTick): tak dlouho se ceka bez selhani
+// Helper hlasi dlouhou praci hlavniho vlakna (helperBusyTick, od v103c obnovovany kazdych 0,5 s po dobu prace):
+// tick mladsi nez tento limit = helper pracuje, ceka se bez selhani
 const DWORD kBusyMaxMs = 30000;
+// Helper nepotvrzuje snimky (most bez pipeline nebo vynechane snimky): most se vypne az po tolika ms bez potvrzeni
+// (zivy helper mimo dlouhou praci), ne podle poctu koncu sceny - na pomalem PC jinak stacilo ~2 s.
+const ULONGLONG kAckStallMaxMs = 30000;
 bool HelperBusy() {
     MemoryBarrier();
     const uint32_t b = g_sh ? g_sh->helperBusyTick : 0;
@@ -887,6 +896,27 @@ void AbortPending(const char* why) {
 // rezim po timeoutu (snimek bez B): helper ho muze zpracovat pozde a cetl by smes snimku N a N+1 (nebo N+1 dvakrat).
 // Normalne uz davno potvrzeno (helper mel cely snimek). true = nic neceka. Helper skoncil -> GPU uvolnit hned (ne az
 // strazce).
+// Helper nepotvrdil vcas (snimek se vynecha). true = most vypnout: helper zije, nepracuje na dlouhe praci a nepotvrdil
+// nic uz kAckStallMaxMs. Doba dlouhe prace helperu (helperBusyTick) se nepocita. Log nejvys 1x za s.
+bool AckStalled(const char* what) {
+    const ULONGLONG now = GetTickCount64();
+    if (!g_ackStallSince || HelperBusy()) g_ackStallSince = now;
+    ++g_timeouts;
+    if (now - g_ackStallLog >= 1000) {
+        g_ackStallLog = now;
+        Log("most: %s (%.1f s bez potvrzeni, vynechano %u, done=%llu)%s", what, (now - g_ackStallSince) / 1000.0,
+            g_timeouts, (unsigned long long)g_sh->helperDoneValue, HelperBusy() ? " - helper hlasi dlouhou praci" : "");
+    }
+    return now - g_ackStallSince >= kAckStallMaxMs;
+}
+void AckResumed() {
+    if (g_ackStallSince && g_timeouts)
+        Log("most: helper zase potvrzuje (po %.1f s, vynechano %u snimku)", (GetTickCount64() - g_ackStallSince) / 1000.0,
+            g_timeouts);
+    g_ackStallSince = 0;
+    g_timeouts = 0;
+}
+
 bool AckPending(DWORD timeoutMs) {
     AcquireSRWLockExclusive(&g_pendLock);
     const uint64_t pend = g_pendingN;
@@ -946,7 +976,8 @@ void StopBridge() {
 // nedostane. Konci po zasahu nebo kdyz je most trvale vypnuty a nic neceka.
 DWORD WINAPI WatchdogProc(void*) {
     bool dead = false;
-    ULONGLONG busySeen = 0;  // naposledy videna dlouha prace helperu (limit 5 s se pocita az od jejiho konce)
+    ULONGLONG busySeen = 0;  // naposledy videna dlouha prace helperu (limit se pocita az od jejiho konce)
+    uint64_t warnedFor = 0;  // snimek, pro ktery uz WARN v logu je
     for (;;) {
         if (dead)
             Sleep(10);
@@ -966,8 +997,14 @@ DWORD WINAPI WatchdogProc(void*) {
             busySeen = now;
             continue;
         }
-        if (dead || now - (since > busySeen ? since : busySeen) >= kPendingTimeoutMs)
-            AbortPending(dead ? "helper skoncil" : "helper nepotvrdil snimek do 5 s");
+        const ULONGLONG waited = now - (since > busySeen ? since : busySeen);
+        if (!dead && waited >= kPendingWarnMs && warnedFor != pend) {
+            warnedFor = pend;
+            Log("most: WARN - helper nepotvrdil snimek %llu do %lu ms (GPU hry na nej ceka) - cekam dal, nejvys %lu s "
+                "(pomale PC?)", (unsigned long long)pend, kPendingWarnMs, kPendingTimeoutMs / 1000);
+        }
+        if (dead || waited >= kPendingTimeoutMs)
+            AbortPending(dead ? "helper skoncil" : "helper nepotvrdil snimek do 30 s");
     }
 }
 
@@ -1094,14 +1131,17 @@ void Interop_OnPresent() {
         ProxyPartBPerf(partB, sizeof partB);  // cast B: prazdne, kdyz se v intervalu neobjevila
         ProxyLatencyPerf(lat, sizeof lat);    // regulator latence: prazdne pri [latency] Mode=0
         ProxyReactivePerf(rm, sizeof rm);     // maska reaktivity: prazdne pri [upscale] ReactiveMask=0
-        Log("vykon %.1f s: %.1f FPS, snimek prum %.2f / max %.2f ms | %s | %s%s%s%s%s", el / 1000.0,
-            g_stFrame.n * 1000.0 / el, g_stFrame.avg(), g_stFrame.max, bridge, obj, objHelper, partB, lat, rm);
+        char cam[200];
+        ProxyCamInputPerf(cam, sizeof cam);   // otaceni kamery a vstup mysi za interval
+        Log("vykon %.1f s: %.1f FPS, snimek prum %.2f / max %.2f ms | %s | %s%s%s%s%s%s", el / 1000.0,
+            g_stFrame.n * 1000.0 / el, g_stFrame.avg(), g_stFrame.max, bridge, obj, objHelper, partB, lat, rm, cam);
     } else {
         char obj[640];
         ProxyObjMvPerf(obj, sizeof obj);  // jen vynulovat pocitadla intervalu
         ProxyPartBPerf(obj, sizeof obj);
         ProxyLatencyPerf(obj, sizeof obj);
         ProxyReactivePerf(obj, sizeof obj);
+        ProxyCamInputPerf(obj, sizeof obj);
     }
     g_stFrame = g_stTotal = g_stWait = g_stFlush = g_stSubmit = g_stLock = g_stSlot = g_stRec = g_stGpuA = g_stGpuB = g_stGpuAB = Acc();
     g_stSkipped = 0;
@@ -1255,18 +1295,17 @@ static bool SceneEnd(const SceneEndInfo& in) {
     // Pipeline: B minuleho snimku muze na GPU cekat na helper; dalsi zapis do sdilene pameti az po jeho potvrzeni.
     {
         const LONGLONG w0 = Qpc();
-        const bool acked = AckPending(kAckWaitMs);
+        // Helper uz minule nestihl: hra na nej dal neceka 100 ms na kazdem konci sceny (jinak by jela na <= 10 FPS),
+        // jen se podiva
+        const bool acked = AckPending(g_ackStallSince ? 1 : kAckWaitMs);
         g_fWait += QpcMs(w0, Qpc());
         if (!acked) {
             if (g_aborted || g_failed) return false;  // helper skoncil: GPU uz uvolnena, most vypnuty (log v AbortPending)
-            // Helper je pomaly (napr. obnova DLSS feature): snimek vynechat jako drive. Strazce hlida limit 5 s.
-            if (HelperBusy()) return false;  // helper vytvari generator FG apod.: jen vynechat, neni to selhani
-            ++g_timeouts;
-            Log("most: helper jeste neprevzal minuly snimek (%llu ms, done=%llu)", (unsigned long long)kAckWaitMs,
-                (unsigned long long)g_sh->helperDoneValue);
-            if (g_timeouts >= 20) Fail("helper opakovane neodpovida");
+            // Helper je pomaly (napr. obnova DLSS feature): snimek vynechat jako drive. Strazce hlida limit.
+            if (AckStalled("helper jeste neprevzal minuly snimek")) Fail("helper opakovane neodpovida");
             return false;
         }
+        AckResumed();
     }
     // Import zdroju nebo nova DLSS feature v helperu jeste bezi: snimek vynechat (bez cekani)
     if (g_req != REQ_NONE && !PollReq()) return false;
@@ -1585,15 +1624,13 @@ static bool SceneEnd(const SceneEndInfo& in) {
     if (!pipe) {
         // Synchronni rezim: B az po odeslani prace helperu (signal semHelper = N uz je ve fronte GPU)
         const LONGLONG w0 = Qpc();
-        const bool done = WaitHelper(100, [N] { return g_sh->helperDoneValue >= N; });
+        const bool done = WaitHelper(g_ackStallSince ? 10 : 100, [N] { return g_sh->helperDoneValue >= N; });
         g_fWait += QpcMs(w0, Qpc());
         if (!done) {
-            if (!HelperBusy()) ++g_timeouts;
-            Log("most: helper neodpovedel vcas (snimek %llu, done=%llu)", (unsigned long long)N,
-                (unsigned long long)g_sh->helperDoneValue);
-            if (g_timeouts >= 20) Fail("helper opakovane neodpovida");
+            if (AckStalled("helper neodpovedel vcas")) Fail("helper opakovane neodpovida");
             return false;
         }
+        AckResumed();
     }
     // Pipeline: stav helperu (vystup, DLAA) je z minuleho potvrzeni - jen pro log, o snimek pozdeji nevadi.
     LogOutput();  // fallback po selhanem vyhodnoceni pri S > 1 prijde bez handshake

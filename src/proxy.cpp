@@ -55,6 +55,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <share.h>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -914,6 +915,10 @@ static UINT g_jitVpW, g_jitVpH;         // viewport, pro ktery g_jx / g_jy plati
 // Kamera hlavniho pohledu (puvodni, bez jitteru) - pro motion vektory
 static float g_cam[16], g_prevCam[16];
 static bool g_camSet, g_prevCamValid;
+// Otaceni kamery hlavniho pohledu (soucet uhlu mezi snimky, strih > 45 st se nepocita) a snimky s kamerou - cast
+// radku "vykon" a samokontrola "mys neotaci kamerou" (menu.inl ProxyCamInputPerf, present.cpp SelfCheck)
+static double g_ciTurnDeg;
+static unsigned g_ciCamFrames;
 
 // Kandidati na kameru hlavniho pohledu: ruzne puvodni (bez jitteru) cViewProj perspektivnich drawu
 // do plneho RGBA8 cile pred koncem sceny. Source kresli nejdriv 3D skybox (vlastni kamera se stejnou
@@ -1773,6 +1778,7 @@ enum OsdWhat {
     OSD_RENDER,      // zmena renderu za behu (mat_viewportscale, F4 usporny rezim): text v g_osdRender
     OSD_REPORT,      // menu: hlaseni chyby ulozeno
     OSD_REPORT_FAIL, // menu: hlaseni chyby nejde ulozit
+    OSD_FG_SUBST,    // DLSS-G adaptivni na tomto GPU neni: nahradni rezim FG
     OSD_COUNT
 };
 static void OsdNotify(int what);  // src\menu.inl
@@ -2016,10 +2022,25 @@ static void SelectCamera() {
 #include "objmv.inl"
 #include "reactive.inl"  // maska reaktivity (pruhledne a aditivni draw -> DLSS / FSR)
 
+// Retezec latence vstup -> Present -> zobrazeni (src/latchain.inl v present.cpp, [debug] LatChain): jen mereni
+extern bool g_lcWantFirst;
+void Lc_First();
+void Lc_PresentEnter(LONGLONG tSubmit, float camDeg);
+void Lc_GpuFrame(LONGLONG tSubmit, double gpuTsMs, LONGLONG tDone);
+bool Lc_OnPumpMsg(MSG* m, bool mouse);
+bool Ss_Delay(double ms);  // [latency] SampleSync: spanek regulatoru v pumpe zprav (src/latchain.inl)
+static float g_lcCam = -1.0f;  // otoceni kamery v tomto snimku (OnFrameEnd), < 0 = bez kamery
+
 // ---------------------------------------------------------------------------
 // Adaptivni obdoba Reflexu: kdyz je hra omezena GPU, uspi vlakno v Present tak, aby fronta GPU mela <= 1 snimek
 // ---------------------------------------------------------------------------
 #include "latency.inl"
+
+// Present hry pro mereni latence: cas odeslani regulatoru (stejny jako LatSlot::tSubmit, paruje konec GPU)
+static void LcEnter() {
+    const LatSlot& s = g_lat.s[g_lat.n % kLatRing];
+    Lc_PresentEnter(g_lat.res && s.issued && s.n == g_lat.n ? s.tSubmit : 0, g_lcCam);
+}
 
 // Cast B, konec snimku: snimek bez draw roztazeni a jednorazova pojistka (docs\advokat-upscaling-B2.md, D4).
 // mat_viewportscale se uklada do config.cfg hry: kdyz zustane < 1 a most scenu nezpracovava (vypnuty, selhal, helper
@@ -2368,6 +2389,7 @@ static void FailNotesFrameEnd() {
         g_osdFgRetry = fb == 2;
         OsdNotify(OSD_FAIL_FG);
     }
+    if (Present_TakeFgSubstNote()) OsdNotify(OSD_FG_SUBST);
     if (Interop_TakeFailNote()) OsdNotify(OSD_FAIL_BRIDGE);
     if (const int r = g_reportDone.exchange(0)) OsdNotify(r);
     // Upozorneni pri startu: az po nacteni okna hry (~300 snimku), DXVK pred bezpecnym startem
@@ -2389,6 +2411,14 @@ static void OnFrameEnd() {
     LightsPatchUpdate();  // cast B: svetla enginu ([upscale] LightsB, jinak jen pocitadlo)
     if (g_main) ApplyMipBias(g_main, false);  // hodnoty hry zpet (Present = mimo scenu)
     if (!g_sceneEndDone) SelectCamera();  // konec sceny nenastal: kamera aspon jako "predchozi"
+    g_lcCam = -1.0f;
+    if (g_camSet && g_prevCamValid) {
+        double cd = 0.0, ca = 0.0;
+        const bool cm = CamMotion(g_cam, g_prevCam, &cd, &ca);
+        if (cm && ca < 45.0) g_ciTurnDeg += ca;
+        if (cm) g_lcCam = (float)ca;
+        ++g_ciCamFrames;
+    }
     // kamera tohoto snimku -> "predchozi" pro dalsi snimek
     if (g_camSet) {
         memcpy(g_prevCam, g_cam, sizeof g_cam);
@@ -4052,12 +4082,14 @@ static HRESULT STDMETHODCALLTYPE H_Present(IDirect3DDevice9* d, const RECT* a, c
     if (mine) {
         OnFrameEnd();
         LatBeforePresent(d);
+        LcEnter();
     }
     if (t_inPresent == 1 && Present_Enabled())  // spike S2: snimek helperu, cil prezentace DXVK
         h = Present_OnPresent(d, nullptr, h, mine, _ReturnAddress(), (void*)&H_Present);
     HRESULT hr = o_Present(d, a, b, h, r);
     if (t_inPresent == 1 && Present_Enabled()) Present_AfterPresent(d, mine);
     if (mine) LatAfterPresent(d, hr);
+    if (mine) Present_FrameReleased();
     --t_inPresent;
     return hr;
 }
@@ -4068,12 +4100,14 @@ static HRESULT STDMETHODCALLTYPE H_PresentEx(IDirect3DDevice9Ex* d, const RECT* 
     if (mine) {
         OnFrameEnd();
         LatBeforePresent(g_main);
+        LcEnter();
     }
     if (t_inPresent == 1 && Present_Enabled())
         h = Present_OnPresent((IDirect3DDevice9*)d, nullptr, h, mine, _ReturnAddress(), (void*)&H_Present);
     HRESULT hr = o_PresentEx(d, a, b, h, r, f);
     if (t_inPresent == 1 && Present_Enabled()) Present_AfterPresent((IDirect3DDevice9*)d, mine);
     if (mine) LatAfterPresent(g_main, hr);
+    if (mine) Present_FrameReleased();
     --t_inPresent;
     return hr;
 }
@@ -4088,6 +4122,7 @@ static HRESULT STDMETHODCALLTYPE H_SCPresent(IDirect3DSwapChain9* s, const RECT*
                 mine = true;
                 OnFrameEnd();
                 LatBeforePresent(g_main);
+                LcEnter();
             }
             if (Present_Enabled())
                 h = Present_OnPresent(dev, s, h, mine, _ReturnAddress(), (void*)&H_Present);
@@ -4097,11 +4132,13 @@ static HRESULT STDMETHODCALLTYPE H_SCPresent(IDirect3DSwapChain9* s, const RECT*
     HRESULT hr = o_SCPresent(s, a, b, h, r, f);
     if (mine && Present_Enabled()) Present_AfterPresent(g_main, true);
     if (mine) LatAfterPresent(g_main, hr);
+    if (mine) Present_FrameReleased();
     --t_inPresent;
     return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE H_SetVSConstF(IDirect3DDevice9* d, UINT start, const float* data, UINT count) {
+    if (g_lcWantFirst && d == g_main) Lc_First();
     if (d == g_main && !OmGuarded() && data && start < 256) {
         UINT n = std::min(count, 256u - start);
         memcpy(&g_vsConst[start * 4], data, n * 16);
@@ -4329,6 +4366,7 @@ static void CapSurface(const char* what, DWORD idx, IDirect3DSurface9* s, const 
 static HRESULT STDMETHODCALLTYPE H_SetRT(IDirect3DDevice9* d, DWORD i, IDirect3DSurface9* s) {
     if (OmGuarded()) return o_SetRT(d, i, s);  // davka MV objektu: bez zmeny stinu
     if (g_lat.res && !g_lat.broken && d == g_main) LatPollCheap();  // presnejsi cas dokonceni snimku (odhad latence)
+    if (g_lcWantFirst && d == g_main) Lc_First();
     if (d == g_main && g_sceneEndPending) FirePendingSceneEnd(d, "SetRenderTarget");
     if (d == g_main && i == 0) {
         D3DSURFACE_DESC desc = {};
@@ -4373,6 +4411,7 @@ static HRESULT STDMETHODCALLTYPE H_SetDS(IDirect3DDevice9* d, IDirect3DSurface9*
 static HRESULT STDMETHODCALLTYPE H_Clear(IDirect3DDevice9* d, DWORD n, const D3DRECT* r, DWORD fl, D3DCOLOR c,
                                          float z, DWORD st) {
     if (OmGuarded()) return o_Clear(d, n, r, fl, c, z, st);
+    if (g_lcWantFirst && d == g_main) Lc_First();
     if (d == g_main && g_sceneEndPending) FirePendingSceneEnd(d, "Clear");
     if (d == g_main && g_capState == CAP_ACTIVE) Cap("CLR flags=0x%X color=0x%08X z=%.3f", fl, c, z);
     if (d == g_main && (fl & D3DCLEAR_TARGET) && g_sceneEndDone && g_sceneRT && g_rt0 == g_sceneRT &&
@@ -5179,8 +5218,19 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         const bool prevFail = PrevLogFailure(logPath, prevWhy, sizeof prevWhy);
         if (prevFail) KeepCrashLog(logPath);
         MoveFileExW(logPath.c_str(), (logPath + L".prev").c_str(), MOVEFILE_REPLACE_EXISTING);
-        g_log = _wfopen(logPath.c_str(), L"w");
+        // Sdileni cteni i zapisu (sledovani logu jinym programem nevadi). Kdyz log drzi jiny program bez sdileni
+        // zapisu (editor, antivir), nahradni soubor bms_dlss.<pid>.log - jinak by sezeni nemelo zadny log.
+        g_log = _wfsopen(logPath.c_str(), L"w", _SH_DENYNO);
+        std::wstring altLog;
+        const DWORD logErr = g_log ? 0 : GetLastError();
+        if (!g_log) {
+            altLog = std::wstring(g_dir) + L"\\bms_dlss." + std::to_wstring(GetCurrentProcessId()) + L".log";
+            g_log = _wfsopen(altLog.c_str(), L"w", _SH_DENYNO);
+        }
         Log("%s nacten, slozka: %ls", kMarker, g_dir);
+        if (!altLog.empty())
+            Log("WARNING: bms_dlss.log is locked by another program (error %lu) - this run logs to %ls", logErr,
+                altLog.c_str());
         LogHeader();
         if (prevFail)
             Log("WARNING: the previous run ended with an error: %s (log kept as bms_dlss.crash-*.log)", prevWhy);
@@ -5260,6 +5310,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
             if (!g_fn[i]) Log("WARN: export %s nenalezen", kNames[i]);
         }
         Log("realna knihovna: %p", (void*)g_real);
+        if (g_real && !g_dxvkWarn) Present_HookDxvkVulkan(g_real, IniPath().c_str());
     } else if (reason == DLL_PROCESS_DETACH) {
         g_procExiting = reserved != nullptr;
         Log("konec, snimku: %llu", (unsigned long long)g_frame);

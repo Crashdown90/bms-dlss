@@ -56,6 +56,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <share.h>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -708,9 +709,74 @@ static uint32_t g_objValMax, g_objFrames;
 static uint64_t g_vmPx, g_vmAcc, g_vmMv, g_vmE1, g_vmE0;
 static float g_objTolLogged;
 static uint32_t g_loggedObjMode = UINT32_MAX;    // naposledy zalogovany objMvMode od proxy
-// Limit cekani na vlastni GPU praci: snimek trva milisekundy. Pri ztracenem zarizeni hry by semafor od proxy nemusel
-// prijit nikdy - helper pak skonci s chybou misto nekonecneho cekani (proxy most vypne).
-static const uint64_t kGpuTimeoutNs = 5000000000ull;
+// Limit cekani na vlastni GPU praci: snimek trva milisekundy, ale na pomalem PC (strankovani VRAM pri nacitani mapy,
+// karta se 4-6 GB) muze GPU stat i sekundy. Skutecne zaseknuti GPU konci pres TDR ztratou zarizeni
+// (VK_ERROR_DEVICE_LOST), takze dlouhy limit je jen pojistka. Pri ztracenem zarizeni hry by semafor od proxy nemusel
+// prijit nikdy - helper pak skonci s chybou misto nekonecneho cekani (proxy most vypne). Strazce proxy ceka dele
+// (30 s, interop.cpp), aby chybu nahlasil helper sam.
+static const uint64_t kGpuTimeoutNs = 20000000000ull;
+static const uint64_t kGpuStepNs = 2000000000ull;  // po tomto kroku se cekani zaloguje (WARN) a pokracuje
+
+// Dlouha prace hlavniho vlakna helperu (blokuje potvrzovani snimku mostu: vytvoreni DLSS / FSR / generatoru FG,
+// import, zalozni prechody, konec prezentace): proxy ji po tu dobu nebere jako selhani helperu. helperBusyTick se
+// obnovuje kazdych 0,5 s z vlastniho vlakna (proxy bere za busy tick mladsi nez 30 s), takze pomale PC nema pevny
+// strop - jen pojistku kBusyBeatMaxMs na jednu praci (zaseknuti), pak tick starne a proxy rozhodne podle svych limitu.
+static std::mutex g_busyMx;
+static int g_busyDepth;
+static ULONGLONG g_busySince;
+static const ULONGLONG kBusyBeatMaxMs = 180000;
+static DWORD WINAPI BusyBeatProc(void*) {
+    for (;;) {
+        Sleep(500);
+        std::lock_guard<std::mutex> lk(g_busyMx);
+        if (g_busyDepth > 0 && g_sh && GetTickCount64() - g_busySince < kBusyBeatMaxMs) {
+            g_sh->helperBusyTick = GetTickCount() | 1u;
+            MemoryBarrier();
+        }
+    }
+}
+struct BusyScope {
+    const char* what;
+    explicit BusyScope(const char* w = nullptr) : what(w) {
+        std::lock_guard<std::mutex> lk(g_busyMx);
+        if (g_busyDepth++ == 0) {
+            static bool s_thread;
+            if (!s_thread) {
+                s_thread = true;
+                HANDLE h = CreateThread(nullptr, 0, BusyBeatProc, nullptr, 0, nullptr);
+                if (h) CloseHandle(h);
+            }
+            g_busySince = GetTickCount64();
+            if (g_sh) g_sh->helperBusyTick = GetTickCount() | 1u;
+        }
+        MemoryBarrier();
+    }
+    ~BusyScope() {
+        MemoryBarrier();
+        std::lock_guard<std::mutex> lk(g_busyMx);
+        if (--g_busyDepth == 0) {
+            if (g_sh) g_sh->helperBusyTick = 0;
+            const ULONGLONG ms = GetTickCount64() - g_busySince;
+            if (ms >= 5000) Log("WARN: dlouha prace hlavniho vlakna%s%s trvala %.1f s (pomale PC / nacitani?)",
+                                what ? " " : "", what ? what : "", ms / 1000.0);
+        }
+    }
+};
+
+// Cekani na fence po krocich s logem (do limitNs). VK_TIMEOUT az po celem limitu.
+static VkResult WaitFenceLong(VkFence f, uint64_t limitNs, const char* what) {
+    VkResult r = vk.vkWaitForFences(g_dev, 1, &f, VK_TRUE, kGpuStepNs < limitNs ? kGpuStepNs : limitNs);
+    if (r != VK_TIMEOUT || limitNs <= kGpuStepNs) return r;
+    const ULONGLONG t0 = GetTickCount64() - kGpuStepNs / 1000000ull;
+    BusyScope busy;  // pomale GPU: proxy to po dobu cekani nebere jako selhani helperu (limit hlida tato funkce)
+    Log("WARN: %s: GPU zatim nedobehla (%.0f s) - cekam dal, nejvys %.0f s (pomale GPU / nacitani?)", what,
+        kGpuStepNs / 1e9, limitNs / 1e9);
+    while (r == VK_TIMEOUT && (GetTickCount64() - t0) * 1000000ull < limitNs)
+        r = vk.vkWaitForFences(g_dev, 1, &f, VK_TRUE, kGpuStepNs);
+    Log("%s: GPU %s po %.1f s (VkResult %d)", what, r == VK_SUCCESS ? "dobehla" : "NEDOBEHLA",
+        (GetTickCount64() - t0) / 1000.0, (int)r);
+    return r;
+}
 
 // Hloubka DLSS (BMSD_DEPTH_*), stejne nazvy jako v logu proxy
 static const char* DepthName(uint32_t m) {
@@ -1414,6 +1480,14 @@ static void DestroyHdr() {
 // na zruseny pohled, cte ji jen downsample.comp (LDR), a ten bez g_bigImg.img nebezi.
 static void DestroyBig() { DestroyOwn(g_bigImg); }
 
+// Jednorazove prikazy nedobehly (SubmitInitCmd -> VK_TIMEOUT): GPU obrazy mozna jeste pouziva - neuvolnit, jen
+// zapomenout (zustanou alokovane do konce helperu; nastava jen po minute stojici GPU).
+static void ForgetHdr() {
+    for (OwnImg* o : {&g_linImg, &g_hdrOutImg, &g_expImg}) *o = OwnImg();
+    g_hdrImgOk = false;
+}
+static ULONGLONG g_dlssRetryAt;  // DLSS feature nedobehla na GPU (pomale PC): novy pokus (BridgeMessage), 0 = zadny
+
 // Obrazy a pohledy zavisle na rozliseni + DLSS feature. Volat jen kdyz GPU nic nezpracovava.
 // Poradi: nejdriv feature (muze odkazovat na pameti obrazu jen behem vyhodnoceni, ale uvolnit ji pred nimi),
 // pak obrazy velikosti vystupu (HDR, RGBA8), pak obrazy velikosti vstupu a finalniho obrazu, nakonec pohledy
@@ -1588,8 +1662,13 @@ static void EnsureReactImg() {
     }
 }
 
-// Jednorazove prikazy v g_initCmd (vytvoreni DLSS, priprava obrazu): odeslat a pockat.
+// Jednorazove prikazy v g_initCmd (vytvoreni DLSS, priprava obrazu): odeslat a pockat (po krocich s logem, do 60 s:
+// na pomalem PC pri nacitani muze GPU stat dlouho, skutecne zaseknuti konci ztratou zarizeni). VK_TIMEOUT = GPU
+// prikazy mozna jeste zpracovava: g_initCmd a g_initFence se uz nikdy znovu nepouziji (reset bufferu v behu je
+// neplatne pouziti Vulkanu) - nahradi je nove a stare zustanou alokovane do konce helperu. Volajici pak nesmi rusit
+// nic, na co prikazy odkazuji (SubmitInitAbandoned), a selhani neni trvale.
 static VkResult SubmitInitCmd() {
+    BusyScope busy("(odeslani jednorazovych prikazu)");
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_initCmd;
@@ -1599,7 +1678,25 @@ static VkResult SubmitInitCmd() {
         std::lock_guard<std::mutex> lk(g_queueMx);
         vr = vk.vkQueueSubmit(g_queue, 1, &si, g_initFence);
     }
-    if (vr == VK_SUCCESS) vr = vk.vkWaitForFences(g_dev, 1, &g_initFence, VK_TRUE, 10000000000ull);
+    if (vr == VK_SUCCESS) vr = WaitFenceLong(g_initFence, 60000000000ull, "jednorazove prikazy (vytvoreni DLSS / obrazy)");
+    if (vr == VK_TIMEOUT) {
+        VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, g_pool,
+                                           VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkCommandBuffer nc = VK_NULL_HANDLE;
+        VkFence nf = VK_NULL_HANDLE;
+        const bool ok = vk.vkAllocateCommandBuffers(g_dev, &cai, &nc) == VK_SUCCESS &&
+                        vk.vkCreateFence(g_dev, &fci, nullptr, &nf) == VK_SUCCESS;
+        // Stary buffer a fence se nikdy neuvolni ani nepouziji (GPU je mozna jeste zpracovava)
+        if (ok) {
+            g_initCmd = nc;
+            g_initFence = nf;
+            Log("WARN: jednorazove prikazy nedobehly do 60 s - prikazovy buffer se uz nepouzije (novy pripraven)");
+        } else {  // nedostatek pameti po minute stojici GPU: skutecna chyba, helper skonci (stary buffer nepouzit)
+            g_fatal = true;
+            Error("jednorazove prikazy nedobehly do 60 s a novy prikazovy buffer nejde vytvorit");
+        }
+    }
     return vr;
 }
 
@@ -1654,7 +1751,8 @@ static bool EnsureHdr(uint32_t outW, uint32_t outH) {
     vk.vkEndCommandBuffer(g_initCmd);
     VkResult vr = SubmitInitCmd();
     if (vr != VK_SUCCESS) {
-        DestroyHdr();
+        if (vr == VK_TIMEOUT) ForgetHdr();  // GPU je mozna jeste pouziva
+        else DestroyHdr();
         return Log("vstup HDR: priprava obrazu expozice selhala (%d)", vr), false;
     }
 
@@ -2143,6 +2241,19 @@ static void CreateDlss(float tryScale) {
     }
     VkResult vr = SubmitInitCmd();
     QueryPerformanceCounter(&t1);
+    if (vr == VK_TIMEOUT) {
+        // Pomale GPU (napr. strankovani VRAM pri nacitani): prikazy pro vytvoreni mozna jeste bezi - feature ani obrazy
+        // nerusit (zustanou alokovane), nic neni trvale nedostupne. Novy pokus za 15 s (BridgeMessage -> RecreateDlss).
+        g_dlss = nullptr;
+        g_bigImg = OwnImg();
+        ForgetHdr();
+        g_dlssRetryAt = GetTickCount64() + 15000;
+        char msg[200];
+        snprintf(msg, sizeof msg, "vytvoreni DLSS nedobehlo na GPU do 60 s (pomale PC?) - novy pokus za 15 s");
+        Log("%s", msg);
+        SetHelperMsg(msg);
+        return;
+    }
     if (vr != VK_SUCCESS) {
         ReleaseDlss();
         DestroyBig();
@@ -2751,11 +2862,11 @@ static void DeviceWaitIdleLocked() {
 static bool DrainGpu(const char* why) {
     for (int i = 0; i < kSlots; ++i) {
         if (!g_fenceUsed[i]) continue;
-        const VkResult r = vk.vkWaitForFences(g_dev, 1, &g_fence[i], VK_TRUE, kGpuTimeoutNs);
+        const VkResult r = WaitFenceLong(g_fence[i], kGpuTimeoutNs, why);
         if (r != VK_SUCCESS) {
             g_fatal = true;
             Error("%s: rozpracovany snimek nedobehl na GPU (VkResult %d%s)", why, (int)r,
-                  r == VK_TIMEOUT ? ", limit 5 s - ztracene zarizeni hry?" : "");
+                  r == VK_TIMEOUT ? ", limit 20 s - ztracene zarizeni hry?" : "");
             return false;
         }
     }
@@ -2768,6 +2879,7 @@ static bool DrainGpu(const char* why) {
 // (obrazy velikosti vystupu si CreateDlss / CreateFsr prizpusobi, deskriptory prepise). Zmena renderu nic neimportuje
 // ani nevytvari vlastni obrazy (vsechny W x H).
 static void RecreateDlss() {
+    BusyScope busy;
     const uint32_t p = g_sh->preset, im = g_sh->inputMode;
     const float os = g_sh->outScale;
     const uint32_t rw = g_sh->renderWidth, rh = g_sh->renderHeight;
@@ -2811,6 +2923,7 @@ static void RecreateDlss() {
 // Vyhodnoceni DLSS pri S > 1 selhalo (ProcessFrame, snimek uz odeslan jako kopie): bez supersamplingu dal.
 // Pozadavek proxy zustava potvrzeny; znovu se zkusi az pri dalsi zmene S nebo reimportu.
 static void FallbackToNative() {
+    BusyScope busy;
     const float was = g_outScale;
     const uint32_t ow = g_outW, oh = g_outH;
     const char* name = g_upActive == BMSD_UPSCALER_FSR ? "FSR" : "DLSS";
@@ -2830,6 +2943,7 @@ static void FallbackToNative() {
 // Cast B: vyhodnoceni DLSS selhalo (ProcessFrame, snimek uz odesel roztazeny blitem): feature uvolnit, dal bez DLSS
 // (helperRenderOk = 0 -> proxy most nespousti, roztahuje engine). Neni trvale, viz SubFail.
 static void SubEvalFail() {
+    BusyScope busy;
     if (!DrainGpu("cast B bez DLSS")) return;
     TimingCollectAll();
     ReleaseDlss();
@@ -2844,6 +2958,7 @@ static void SubEvalFail() {
 // nebezel zadny upscaler). FSR se zkusi znovu pri dalsi zmene od proxy (RecreateDlss); trvale vypnuti az po
 // kFsrMaxEvalFails selhanich za sebou.
 static void FsrEvalFail() {
+    BusyScope busy;
     if (!DrainGpu("FSR selhalo")) return;
     TimingCollectAll();
     ReleaseFsr();
@@ -2865,6 +2980,7 @@ static void FsrEvalFail() {
 // Vyhodnoceni DLSS selhalo (S = 1, cast A; snimek uz odesel jako kopie, DlaaFail uz DLSS trvale vypnulo): feature
 // uvolnit (nedrzet VRAM) a zkusit FSR, symetricky s FsrEvalFail (D1). CreateUpscaler pri g_dlaaBroken DLSS preskoci.
 static void DlssEvalFail() {
+    BusyScope busy;
     if (!DrainGpu("DLSS selhalo")) return;
     TimingCollectAll();
     ReleaseDlss();
@@ -2872,6 +2988,7 @@ static void DlssEvalFail() {
 }
 
 static bool ImportResources() {
+    BusyScope busy;
     if (!DrainGpu("reimport zdroju")) return false;
     {  // test pomaleho importu (proxy na nej nesmi blokovat hru ani most vypnout): BMS_DLSS_TEST_SLOWIMPORT=ms
         static int s_slow = -1;
@@ -3330,11 +3447,11 @@ static bool ProcessFrame(uint64_t N, uint32_t mode) {
     int s = g_slot;
     g_slot = (g_slot + 1) % kSlots;
     if (g_fenceUsed[s]) {
-        const VkResult wr = vk.vkWaitForFences(g_dev, 1, &g_fence[s], VK_TRUE, kGpuTimeoutNs);
+        const VkResult wr = WaitFenceLong(g_fence[s], kGpuTimeoutNs, "snimek mostu");
         if (wr != VK_SUCCESS) {
             g_fatal = true;
             return Error("snimek z doby pred %d snimky nedobehl na GPU (VkResult %d%s)", kSlots, (int)wr,
-                         wr == VK_TIMEOUT ? ", limit 5 s - ztracene zarizeni hry?" : ""),
+                         wr == VK_TIMEOUT ? ", limit 20 s - ztracene zarizeni hry?" : ""),
                    false;
         }
         vk.vkResetFences(g_dev, 1, &g_fence[s]);
@@ -4075,6 +4192,16 @@ static bool BridgeMessage() {
         if (g_fatal) return false;
         PublishState();
     }
+    if (g_dlssRetryAt && GetTickCount64() >= g_dlssRetryAt) {
+        // Vytvoreni DLSS predtim nedobehlo na GPU (pomale PC): zkusit znovu
+        g_dlssRetryAt = 0;
+        if (!g_dlss && !g_dlaaBroken) {
+            Log("DLSS: novy pokus o vytvoreni po predchozim pomalem GPU");
+            RecreateDlss();
+            if (g_fatal) return false;
+            PublishState();
+        }
+    }
     return true;
 }
 
@@ -4113,7 +4240,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR cmdLine, int) {
     // Log minuleho spusteni se zachova jako .prev.
     MoveFileExW((g_dir + L"\\bms_dlss_helper.log").c_str(), (g_dir + L"\\bms_dlss_helper.log.prev").c_str(),
                 MOVEFILE_REPLACE_EXISTING);
-    g_log = _wfopen((g_dir + L"\\bms_dlss_helper.log").c_str(), L"w");
+    // Sdileni cteni i zapisu; log zamceny jinym programem -> nahradni bms_dlss_helper.<pid>.log
+    g_log = _wfsopen((g_dir + L"\\bms_dlss_helper.log").c_str(), L"w", _SH_DENYNO);
+    if (!g_log)
+        g_log = _wfsopen((g_dir + L"\\bms_dlss_helper." + std::to_wstring(GetCurrentProcessId()) + L".log").c_str(),
+                         L"w", _SH_DENYNO);
     QueryPerformanceFrequency(&g_qpf);
 
     DWORD pid = wcstoul(cmdLine, nullptr, 10);

@@ -55,6 +55,7 @@ static struct MenuCfg {
     bool startHint = true;    // [menu] StartHint: po startu hry na 6 s radek "Nastaveni modu: Alt+N"
     bool fpsCounter = false;  // [menu] FpsCounter: ukazatel FPS vpravo nahore (skutecne / zobrazene)
     bool overlayVersions = false;  // [menu] OverlayVersions: pod nim radek s bezicim upscalerem a FG (verze, nasobek)
+    bool diag = false;        // [menu] DiagOverlay (v103g): diagnostika plynulosti vpravo nahore (hra, monitor, preskoceno, FG, graf)
     int testOpenSec = 0;      // [menu] TestOpenSec: tolik sekund po prvnim Present otevrit menu bez klaves
     bool testShot = false;    // [menu] TestShot: po otevreni ulozit backbuffer do bms_dlss_menu_shot_N.bmp
     std::wstring testKeys;    // [menu] TestKeys: up,down,left,right,enter,esc,tab,del,menu,shot,w<ms>
@@ -144,6 +145,7 @@ static void MenuLoadConfig() {
     c.startHint = wcstol(IniStr(L"menu", L"StartHint", L"1").c_str(), nullptr, 0) != 0;
     c.fpsCounter = wcstol(IniStr(L"menu", L"FpsCounter", L"0").c_str(), nullptr, 0) != 0;
     c.overlayVersions = wcstol(IniStr(L"menu", L"OverlayVersions", L"0").c_str(), nullptr, 0) != 0;
+    c.diag = wcstol(IniStr(L"menu", L"DiagOverlay", L"0").c_str(), nullptr, 0) != 0;
     g_keyBeep = wcstol(IniStr(L"menu", L"Beep", L"1").c_str(), nullptr, 0) != 0;
     c.testOpenSec = std::max(0, (int)wcstol(IniStr(L"menu", L"TestOpenSec", L"0").c_str(), nullptr, 0));
     c.testShot = wcstol(IniStr(L"menu", L"TestShot", L"0").c_str(), nullptr, 0) != 0;
@@ -364,10 +366,92 @@ static void MenuHookGetMsg(MenuHook& h) {
             h.tid, GetLastError());
 }
 
+// Vstup mysi, ktery si vlakno hry vyzvedlo z fronty (WH_GETMESSAGE, jen pocita): raw input mysi (udalosti a soucet
+// |dx| + |dy| relativniho pohybu) a WM_MOUSEMOVE. Cast radku "vykon" a samokontrola "mys neotaci kamerou".
+static std::atomic<uint32_t> g_ciMouseEv, g_ciMouseMove;
+static std::atomic<uint64_t> g_ciMouseDist;
+// Aktivace hry podle zprav, ktere dostalo okno hry (WM_ACTIVATEAPP; Source podle ni povoluje mys a bez ni spi
+// engine_no_focus_sleep): 1 = aktivni, 0 = neaktivni, -1 = zatim zadna; cas posledni zmeny (GetTickCount64)
+static std::atomic<int> g_ciAppActive{-1};
+static std::atomic<uint64_t> g_ciAppActTick;
+static std::atomic<uint32_t> g_ciAppActN;
+static void CiNoteActivate(HWND h, WPARAM wp) {
+    if (h != g_menuGameWnd) return;
+    g_ciAppActive.store(wp ? 1 : 0, std::memory_order_relaxed);
+    g_ciAppActTick.store(GetTickCount64(), std::memory_order_relaxed);
+    g_ciAppActN.fetch_add(1, std::memory_order_relaxed);
+}
+static LRESULT CALLBACK CiCallWndProc(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && lp) {
+        const CWPSTRUCT* c = (const CWPSTRUCT*)lp;
+        if (c->message == WM_ACTIVATEAPP) CiNoteActivate(c->hwnd, c->wParam);
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+static LRESULT CALLBACK CiGetMsgProc(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && wp == PM_REMOVE && lp) {
+        MSG* m = (MSG*)lp;
+        if (Lc_OnPumpMsg(m, false)) return CallNextHookEx(nullptr, code, wp, lp);  // znacka mereni latence -> WM_NULL
+        if (m->message == WM_ACTIVATEAPP) CiNoteActivate(m->hwnd, m->wParam);
+        if (m->message == WM_INPUT) {
+            RAWINPUT ri;
+            UINT n = sizeof ri;
+            if (GetRawInputData((HRAWINPUT)m->lParam, RID_INPUT, &ri, &n, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+                ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                g_ciMouseEv.fetch_add(1, std::memory_order_relaxed);
+                g_ciMouseDist.fetch_add((uint64_t)(labs(ri.data.mouse.lLastX) + labs(ri.data.mouse.lLastY)),
+                                        std::memory_order_relaxed);
+                if (ri.data.mouse.lLastX || ri.data.mouse.lLastY) Lc_OnPumpMsg(m, true);
+            }
+        } else if (m->message == WM_MOUSEMOVE) {
+            g_ciMouseMove.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+static bool g_ciHooked;
+static uint64_t g_ciLastDist;
+static uint32_t g_ciLastEv, g_ciLastMove;
+static double g_ciLastTurn;
+static unsigned g_ciLastCamFrames;
+
+// Cast radku "vykon" (interop.cpp): otaceni kamery a vstup mysi za interval
+void ProxyCamInputPerf(char* buf, size_t n) {
+    if (!n) return;
+    const uint64_t dist = g_ciMouseDist.load(std::memory_order_relaxed);
+    const uint32_t ev = g_ciMouseEv.load(std::memory_order_relaxed), mv = g_ciMouseMove.load(std::memory_order_relaxed);
+    CURSORINFO ci = {sizeof ci};
+    const bool cur = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING);
+    const int act = g_ciAppActive.load(std::memory_order_relaxed);
+    snprintf(buf, n, " | kamera: otoceni %.1f st (%u snimku s kamerou), mys%s: %u udalosti, pohyb %llu bodu, WM_MOUSEMOVE %u, "
+             "kurzor %s, hra aktivni (WM_ACTIVATEAPP) %s (zmen %u)",
+             g_ciTurnDeg - g_ciLastTurn, g_ciCamFrames - g_ciLastCamFrames, g_ciHooked ? "" : " (bez hacku)", ev - g_ciLastEv,
+             (unsigned long long)(dist - g_ciLastDist), mv - g_ciLastMove, cur ? "viditelny" : "skryty",
+             act < 0 ? "?" : act ? "ano" : "NE", g_ciAppActN.load(std::memory_order_relaxed));
+    g_ciLastTurn = g_ciTurnDeg;
+    g_ciLastCamFrames = g_ciCamFrames;
+    g_ciLastDist = dist;
+    g_ciLastEv = ev;
+    g_ciLastMove = mv;
+}
+
+// Pro samokontrolu (present.cpp, vlakno hry): kumulativni hodnoty od startu
+void Proxy_CamInputTotals(double* turnDeg, unsigned* camFrames, uint64_t* mouseDist, bool* hooked, int* appActive) {
+    *turnDeg = g_ciTurnDeg;
+    *camFrames = g_ciCamFrames;
+    *mouseDist = g_ciMouseDist.load(std::memory_order_relaxed);
+    *hooked = g_ciHooked;
+    *appActive = g_ciAppActive.load(std::memory_order_relaxed);
+}
+
 static void MenuHookThread(DWORD tid, const char* what) {
     if (!tid) return;
     for (int i = 0; i < g_nMhooks; ++i)
         if (g_mhooks[i].tid == tid) return;
+    if (!g_ciHooked && tid == g_menuGameTid && SetWindowsHookExW(WH_GETMESSAGE, CiGetMsgProc, nullptr, tid)) {
+        g_ciHooked = true;
+        SetWindowsHookExW(WH_CALLWNDPROC, CiCallWndProc, nullptr, tid);
+    }
     if (g_nMhooks >= kMenuMaxHooks) return;
     const HHOOK h = SetWindowsHookExW(WH_KEYBOARD, MenuKbdProc, nullptr, tid);
     if (!h) {
@@ -1295,38 +1379,49 @@ static void EcoInfo(wchar_t* out, int n) {
     swprintf(out, n, L"%ls %ls (%u×%u)", q, num, g_renderW, g_renderH);
 }
 
-// --- Frame Generation (ini [fg] Mode=0|dlssg|fsr2x|fsradaptive, TargetFps). Stav a prepinani: src\present.cpp
+// --- Frame Generation (ini [fg] Mode=0|dlssg|fsr2x|fsradaptive|dlssgadaptive, TargetFps). Stav a prepinani: src\present.cpp
 // (Present_Fg*). DLSS-G 2x a FSR 2x generuje hlavni helper; zapnuti i vypnuti plati hned (presenter v helperu se
 // zapne / zastavi za behu, [fg] LiveSwitch). FSR adaptivni zatim "pripravuje se". Jen kdyz zarizeni hry nejde
 // presmerovat (VSync ve hre, cela obrazovka v jinem rozliseni, LiveSwitch=0) nebo presenter spadl do zalohy, plati
 // zapnuti az po restartu hry (poznamka).
-enum FgMode { FG_OFF, FG_DLSSG, FG_FSR2X, FG_FSR_ADAPTIVE, FG_COUNT };
+enum FgMode { FG_OFF, FG_DLSSG, FG_FSR2X, FG_FSR_ADAPTIVE, FG_DLSSG_ADAPTIVE, FG_COUNT };
 static_assert(FG_OFF == BMSD_FG_OFF && FG_DLSSG == BMSD_FG_DLSSG && FG_FSR2X == BMSD_FG_FSR2X &&
-                  FG_FSR_ADAPTIVE == BMSD_FG_FSRADAPT && FG_COUNT == BMSD_FG_COUNT,
+                  FG_FSR_ADAPTIVE == BMSD_FG_FSRADAPT && FG_DLSSG_ADAPTIVE == BMSD_FG_DLSSGADAPT &&
+                  FG_COUNT == BMSD_FG_COUNT,
               "FgMode = BMSD_FG_*");
 static int ChFgMode(Choice* out, int max) {
+    // poradi v menu: pevne nasobky, pak adaptivni (cisla rezimu jsou BMSD_FG_*). DLSS-G adaptivni jen na GPU s DLSS-G
+    // nad 2x (RTX 50) - jinde seda, duvod v poznamce.
     const Choice k[] = {ChS(FG_OFF, S_OFF, "0"),
                         ChS(FG_DLSSG, S_FG_DLSSG, "dlssg", Present_FgModeAvailable(BMSD_FG_DLSSG) ? 0 : CHF_SOON),
                         ChS(FG_FSR2X, S_FG_FSR2X, "fsr2x", Present_FgModeAvailable(BMSD_FG_FSR2X) ? 0 : CHF_SOON),
+                        ChS(FG_DLSSG_ADAPTIVE, S_FG_DLSSGADAPT, "dlssgadaptive",
+                            Present_FgModeAvailable(BMSD_FG_DLSSGADAPT) ? 0 : CHF_SOON),
                         ChS(FG_FSR_ADAPTIVE, S_FG_FSRADAPT, "fsradaptive",
                             Present_FgModeAvailable(BMSD_FG_FSRADAPT) ? 0 : CHF_SOON)};
     return MenuCopyChoices(k, FG_COUNT, out, max);
 }
 static int GetFgMode() { return Present_FgGetMode(); }
-static bool FgAdaptSel() { return Present_FgGetMode() == BMSD_FG_FSRADAPT; }
+static bool FgAdaptSel() {
+    const int m = Present_FgGetMode();
+    return m == BMSD_FG_FSRADAPT || m == BMSD_FG_DLSSGADAPT;
+}
 static void SetFgMode(int id, Src src) {
     if (id < FG_OFF || id >= FG_COUNT || !Present_FgModeAvailable(id)) return;
     Present_FgSetMode(id);
     Log("frame generation: %s%s%s",
-        id == FG_DLSSG ? "DLSS-G 2x" : id == FG_FSR2X ? "FSR" : id == FG_FSR_ADAPTIVE ? "FSR adaptivni" : "vypnuto",
+        id == FG_DLSSG ? "DLSS-G" : id == FG_FSR2X ? "FSR" : id == FG_FSR_ADAPTIVE ? "FSR adaptivni"
+        : id == FG_DLSSG_ADAPTIVE ? "DLSS-G adaptivni" : "vypnuto",
         SrcTag(src),
         id != FG_OFF && !Present_FgPresenterActive() && !Present_FgRetryable()
             ? " - plati az po restartu hry (za behu nejde, viz log prezentace)"
             : "");
 }
 static StrId FgModeNote() {
-    return Present_FgGetMode() != BMSD_FG_OFF && !Present_FgPresenterActive() && !Present_FgRetryable() ? S_NOTE_RESTART
-                                                                                                       : S_NONE;
+    if (Present_FgGetMode() != BMSD_FG_OFF && !Present_FgPresenterActive() && !Present_FgRetryable()) return S_NOTE_RESTART;
+    // DLSS-G na karte je, ale jen 2x (RTX 40): proc je "DLSS-G adaptivni" sede
+    return Present_FgModeAvailable(BMSD_FG_DLSSG) && !Present_FgModeAvailable(BMSD_FG_DLSSGADAPT) ? S_NOTE_FG_DGADAPT_GPU
+                                                                                                  : S_NONE;
 }
 // Nasobek ([fg] Multiplier=auto|2..6): zobrazene snimky na jeden skutecny (5x a 6x od v25j, auto = FgAutoMult). FSR 2x umi jen 2x; DLSS-G podle GPU (helper hlasi
 // NGX MultiFrameCountMax: RTX 50 4x, RTX 40 2x). Volby nad moznosti rezimu jsou sede (pri listovani se preskakuji),
@@ -1417,7 +1512,7 @@ static int ChFgTarget(Choice* o, int max) {
     wchar_t autoTxt[24];
     if (Present_FgGetTargetFps() == 0 && fi.targetFps) swprintf(autoTxt, 24, L"%ls (%u)", Tr(S_AUTO), fi.targetFps);
     else swprintf(autoTxt, 24, L"%ls", Tr(S_AUTO));
-    return MenuNumChoices(o, max, Present_FgGetTargetFps(), 20, 1000, fi.targetFps ? (int)fi.targetFps : 158, S_NONE,
+    return MenuNumChoices(o, max, Present_FgGetTargetFps(), 20, kFgTargetMax, fi.targetFps ? (int)fi.targetFps : 158, S_NONE,
                           autoTxt);
 }
 static void SetFgTarget(int id, Src src) {
@@ -1450,8 +1545,10 @@ static void SetFgFill(int id, Src src) {
 static StrId FgAdaptNote() {
     PresentFgInfo fi;
     Present_FgInfo(&fi);
-    return fi.requested == BMSD_FG_FSRADAPT && fi.state == BMSD_FGS_ACTIVE && !fi.adaptEngaged ? S_NOTE_FG_ADAPT_IDLE
-                                                                                                 : S_NONE;
+    return (fi.requested == BMSD_FG_FSRADAPT || fi.requested == BMSD_FG_DLSSGADAPT) && fi.state == BMSD_FGS_ACTIVE &&
+                   !fi.adaptEngaged && Present_FgGetPref() == PREF_ALWAYS  // jinak duvod v radku "Rozhodnuti"
+               ? S_NOTE_FG_ADAPT_IDLE
+               : S_NONE;
 }
 // Radek "Stav": co helper prave dela (skutecne -> zobrazene FPS a cas generatoru), nebo proc negeneruje
 static void FgStateInfo(wchar_t* out, int n) {
@@ -1497,6 +1594,72 @@ static const char* FgStateNote() {
                           ? fi.msg : nullptr;
     if (!t || !*t) return nullptr;
     return g_menuCfg.lang == 0 ? t : "see bms_dlss_helper.log / bms_dlss.log";
+}
+// Kdy adaptivni rezim generuje ([fg] Preference, v103e)
+static int ChFgPref(Choice* o, int max) {
+    const Choice k[] = {ChS(PREF_RESP, S_PREF_RESP, "responsiveness"), ChS(PREF_BAL, S_PREF_BAL, "balanced"),
+                        ChS(PREF_SMOOTH, S_PREF_SMOOTH, "smooth"), ChS(PREF_ALWAYS, S_PREF_ALWAYS, "always"),
+                        ChS(PREF_CUSTOM, S_PREF_CUSTOM, "custom"), ChS(PREF_STEADY, S_PREF_STEADY, "steady")};
+    return MenuCopyChoices(k, Present_FgGetPref() == PREF_STEADY ? 6 : 5, o, max);  // steady jen z ini (pokus)
+}
+static void SetFgPref(int id, Src src) {
+    Present_FgSetPref(id);
+    static const char* const nm[] = {"always", "responsiveness", "balanced", "smooth", "custom", "steady"};
+    Log("frame generation: adaptivni - kdy generovat %s%s", id >= 0 && id < PREF_COUNT ? nm[id] : "?", SrcTag(src));
+}
+static int ChFgPrefFps(Choice* o, int max) {  // v103f2: % cile
+    const int n = MenuNumChoices(o, max, Present_FgGetPrefPct(), 20, 95, 75, S_NONE, nullptr);
+    for (int i = 0; i < n; ++i)
+        if (o[i].id > 0) swprintf(o[i].txt, 24, L"%d %%", o[i].id);
+    return n;
+}
+static void SetFgPrefFps(int id, Src src) {
+    Present_FgSetPrefPct(id);
+    Log("frame generation: adaptivni - vlastni prah %d %% cile%s", Present_FgGetPrefPct(), SrcTag(src));
+}
+static bool VisFgPrefCustom() { return FgAdaptSel() && Present_FgGetPref() == PREF_CUSTOM; }
+static bool VisFgFill() { return FgAdaptSel() && Present_FgGetPref() == PREF_ALWAYS; }  // hranice plati jen pro Vzdy
+// Radek "Rozhodnuti": stav helperu a duvod ("jen skutecne · hra 132 FPS nad prahem 100")
+static void FgPrefInfo(wchar_t* out, int n) {
+    PresentFgPref pi;
+    Present_FgPrefInfo(&pi);
+    wchar_t a[16], b[16], c[16], r[96] = L"";
+    auto num = [](float v, wchar_t* s) { swprintf(s, 16, L"%ld", lroundf(v)); };
+    // v103f (S10): pri generovani bez 2 vzorku kG je FPS hry jen hruby odhad (spis nizko) - ne jako presne cislo
+    const int why = pi.rough && (pi.why == BMSD_PFW_GEN || pi.why == BMSD_PFW_HOLD) ? -1000 : pi.why;
+    switch (why) {
+    case -1000:
+        num(pi.base, a), num(pi.nOff, b);
+        swprintf(r, 96, Tr(S_PFR_ROUGH), a, b);
+        break;
+    case BMSD_PFW_GEN:
+        num(pi.base, a), num(pi.nOn, b), num(pi.gain, c);
+        swprintf(r, 96, Tr(S_PFR_GEN), a, b, c);
+        break;
+    case BMSD_PFW_ABOVE:
+        num(pi.base, a), num(pi.gen ? pi.nOff : pi.nOn, b);
+        swprintf(r, 96, Tr(S_PFR_ABOVE), a, b);
+        break;
+    case BMSD_PFW_GAIN:
+        num(pi.gain, a), num(pi.gainMin, b);
+        swprintf(r, 96, Tr(S_PFR_GAIN), a, b);
+        break;
+    case BMSD_PFW_TARGET:
+        num(pi.base, a);
+        swprintf(r, 96, Tr(S_PFR_TARGET), a);
+        break;
+    case BMSD_PFW_HOLD:
+        num(pi.base, a), num(pi.nOn, b), num(pi.nOff, c);
+        swprintf(r, 96, Tr(S_PFR_HOLD), a, b, c);
+        break;
+    case BMSD_PFW_GUARD: swprintf(r, 96, L"%ls", Tr(S_PFR_GUARD)); break;
+    case BMSD_PFW_USELESS: swprintf(r, 96, L"%ls", Tr(S_PFR_USELESS)); break;
+    case BMSD_PFW_BLOCK: swprintf(r, 96, L"%ls", Tr(S_PFR_BLOCK)); break;
+    case PFI_ALWAYS: swprintf(r, 96, L"%ls", Tr(S_PFR_ALWAYS)); break;
+    case PFI_NOEST: swprintf(r, 96, L"%ls", Tr(S_PFR_NOEST)); break;
+    default: swprintf(r, 96, L"%ls", Tr(S_PFR_WAIT)); break;
+    }
+    swprintf(out, n, L"%ls · %ls", Tr(pi.gen ? S_PFS_GEN : S_PFS_REAL), r);
 }
 
 // --- Vykon
@@ -1627,8 +1790,12 @@ static const MenuItem kItemsFg[] = {
         .Ini("fg", "TargetFps", "0").Def(0).Vis(FgAdaptSel),
     MI(IK_CHOICE, S_IT_FG_REALCAP, S_HELP_FG_REALCAP, Present_FgGetRealCap, SetFgRealCap, ChFgRealCap)
         .Ini("fg", "RealCap", "0").Def(0).Vis(FgAdaptSel),
+    MI(IK_CHOICE, S_IT_FG_PREF, S_HELP_FG_PREF, Present_FgGetPref, SetFgPref, ChFgPref)
+        .Ini("fg", "Preference", "balanced").Def(PREF_BAL).Vis(FgAdaptSel),
+    MI(IK_CHOICE, S_IT_FG_PREFFPS, S_HELP_FG_PREFFPS, Present_FgGetPrefPct, SetFgPrefFps, ChFgPrefFps)
+        .Ini("fg", "PreferencePct", "75").Def(75).Vis(VisFgPrefCustom),
     MI(IK_CHOICE, S_IT_FG_FILL, S_HELP_FG_FILL, Present_FgGetFillBelow, SetFgFill, ChFgFill)
-        .Ini("fg", "FillBelow", "0").Def(0).Vis(FgAdaptSel),
+        .Ini("fg", "FillBelow", "0").Def(0).Vis(VisFgFill),
     MI(IK_TOGGLE, S_IT_FG_MENUPAUSE, S_HELP_FG_MENUPAUSE, []() { return Present_FgGetPauseInMenu() ? 1 : 0; },
        [](int id, Src s) {
            Present_FgSetPauseInMenu(id != 0);
@@ -1636,6 +1803,7 @@ static const MenuItem kItemsFg[] = {
        })
         .Ini("fg", "PauseInMenu", "0").Def(0),
     MI(IK_INFO, S_IT_FG_STATE, S_HELP_FG_STATE).Info(FgStateInfo).NoteTxt(FgStateNote).Note(FgAdaptNote),
+    MI(IK_INFO, S_IT_FG_PREFSTATE, S_HELP_FG_PREFSTATE).Info(FgPrefInfo).Vis(FgAdaptSel),
 };
 static void MenuSetFpsCounter(int id, Src s) {
     g_menuCfg.fpsCounter = id != 0;
@@ -1645,6 +1813,11 @@ static void MenuSetOverlayVersions(int id, Src s) {
     g_menuCfg.overlayVersions = id != 0;
     Log("menu: radek s verzemi %s%s", id ? "zapnuto" : "vypnuto", SrcTag(s));
 }
+static void MenuSetDiag(int id, Src s) {
+    g_menuCfg.diag = id != 0;
+    Log("menu: diagnostika plynulosti %s%s", id ? "zapnuto" : "vypnuto", SrcTag(s));
+}
+static bool VisDiag() { return g_menuCfg.diag; }
 // Hlaseni chyby: logy (i minuleho spusteni a uschovane logy padu), ini a dxvk.conf do slozky
 // bms_dlss_report_<datum_cas> vedle logu. Kopiruje vlastni vlakno (ne vlakno hry); vysledek OSD.
 static wchar_t g_reportName[64];
@@ -1687,6 +1860,14 @@ static const MenuItem kItemsPerf[] = {
     MI(IK_TOGGLE, S_IT_OVERLAYVER, S_HELP_OVERLAYVER, []() { return g_menuCfg.overlayVersions ? 1 : 0; },
        MenuSetOverlayVersions)
         .Ini("menu", "OverlayVersions", "0").Def(0),
+    MI(IK_TOGGLE, S_IT_DIAG, S_HELP_DIAG, []() { return g_menuCfg.diag ? 1 : 0; }, MenuSetDiag)
+        .Ini("menu", "DiagOverlay", "0").Def(0),
+    MI(IK_INFO, S_IT_DG_GAME, S_HELP_DG).Info([](wchar_t* o, int n) { swprintf(o, n, L"%ls", Tr(S_DG_GAME_TXT)); }).Vis(VisDiag),
+    MI(IK_INFO, S_IT_DG_MON, S_HELP_DG).Info([](wchar_t* o, int n) { swprintf(o, n, L"%ls", Tr(S_DG_MON_TXT)); }).Vis(VisDiag),
+    MI(IK_INFO, S_IT_DG_SKIP, S_HELP_DG).Info([](wchar_t* o, int n) { swprintf(o, n, L"%ls", Tr(S_DG_SKIP_TXT)); }).Vis(VisDiag),
+    MI(IK_INFO, S_IT_DG_FG, S_HELP_DG).Info([](wchar_t* o, int n) { swprintf(o, n, L"%ls", Tr(S_DG_FG_TXT)); }).Vis(VisDiag),
+    MI(IK_INFO, S_IT_DG_OUT, S_HELP_DG).Info([](wchar_t* o, int n) { swprintf(o, n, L"%ls", Tr(S_DG_OUT_TXT)); }).Vis(VisDiag),
+    MI(IK_INFO, S_IT_DG_GRAPH, S_HELP_DG).Info([](wchar_t* o, int n) { swprintf(o, n, L"%ls", Tr(S_DG_GRAPH_TXT)); }).Vis(VisDiag),
     MI(IK_ACTION, S_IT_REPORT, S_HELP_REPORT).Act(MenuReportAction),
 };
 static void MenuResetAdvanced();
@@ -2086,6 +2267,14 @@ static void MenuCollectWrites(std::vector<IniWrite>& out, bool usePending) {
             }
             out.push_back({it.iniSec, it.iniKey, ChIni(ch[k]), it.iniDef ? it.iniDef : ""});
         }
+    // v103f (D2): "Vlastni: generovat pod" se uklada do PreferencePct; cislo v Preference (napr. Preference=70) by ho po
+    // restartu prepsalo -> s PreferencePct zapsat i Preference=custom
+    bool fps = false, pref = false;
+    for (const IniWrite& w : out) {
+        if (w.key == "PreferencePct") fps = true;
+        if (w.key == "Preference") pref = true;
+    }
+    if (fps && !pref && Present_FgGetPref() == PREF_CUSTOM) out.push_back({"fg", "Preference", "custom", "balanced"});
 }
 
 static void MenuSaveChanges() {
@@ -2322,7 +2511,7 @@ static struct OsdState {
 static void OsdNotify(int what) {
     if (!g_menuCfg.enable) return;  // [menu] Enable=0: zadny prekryv (mod jako driv)
     const bool warn = what == OSD_WARN_B || what == OSD_SAVE_FAIL || what == OSD_WARN_MSAA || what == OSD_FAIL_FG ||
-                      what == OSD_FAIL_BRIDGE || what == OSD_SAFESTART || what == OSD_DXVK || what == OSD_REPORT_FAIL;
+                      what == OSD_FG_SUBST || what == OSD_FAIL_BRIDGE || what == OSD_SAFESTART || what == OSD_DXVK || what == OSD_REPORT_FAIL;
     if (what == OSD_REPORT && !g_menuCfg.enable) return;
     // "vyzaduje restart" vysvetluje, proc Alt+F9 nic neudelal: ukazat i s [menu] Osd=0, ale jen 2 s
     if (!g_menuCfg.osd && !warn && what != OSD_FG_RESTART && what != OSD_HINT && what != OSD_REPORT) return;
@@ -2370,7 +2559,8 @@ static const MenuItem* MenuItemByOsd(int what) {
 // Zkratky pro testovani (uzivatel 2026-11-19; [keys] TestKeys / Pokrocile -> Zkratky pro testovani). Jen vlakno
 // Present (OnFrameEnd), modKey = modifikator klaves modu drzen a hra v popredi. Zmeny jsou Src::KEY: OSD 2 s, do ini se
 // neukladaji (plati do restartu, uklada jen menu). Hacek tytez stisky polyka (MkDecide, TestKeyOwns).
-//   Alt+F9: Frame Generation vyp -> DLSS-G -> FSR 2x -> vyp, nedostupne rezimy se preskakuji (za behu, i kdyz hra
+//   Alt+F9: Frame Generation vyp -> DLSS-G -> DLSS-G adaptivni -> FSR -> FSR adaptivni -> vyp (poradi jako v menu),
+//           nedostupne rezimy se preskakuji (za behu, i kdyz hra
 //           startovala bez FG). Jen kdyz za behu nejde (zarizeni nepresmerovano, zaloha): nic se nemeni, OSD
 //           "vyzaduje restart".
 //   Alt+F10: upscaler DLSS <-> FSR (z "auto" podle skutecne beziciho; vypnuty mod zapne jako volba v menu).
@@ -2384,14 +2574,15 @@ static void MenuTestKeysFrame(bool modKey) {
             SrcBeep(Src::KEY, MB_ICONHAND);
             OsdNotify(OSD_FG_RESTART);
         } else {
-            static const int kOrder[] = {FG_OFF, FG_DLSSG, FG_FSR2X};
+            static const int kOrder[] = {FG_OFF, FG_DLSSG, FG_DLSSG_ADAPTIVE, FG_FSR2X, FG_FSR_ADAPTIVE};
+            const int nOrder = (int)(sizeof kOrder / sizeof kOrder[0]);
             const int cur = Present_FgGetMode();
             int i = 0;
-            while (i < 3 && kOrder[i] != cur) ++i;  // (FSR adaptivni / neznamy -> jako vyp)
-            if (i == 3) i = 0;
+            while (i < nOrder && kOrder[i] != cur) ++i;  // (neznamy -> jako vyp)
+            if (i == nOrder) i = 0;
             int next = FG_OFF;
-            for (int k = 1; k <= 3; ++k) {
-                const int m = kOrder[(i + k) % 3];
+            for (int k = 1; k <= nOrder; ++k) {
+                const int m = kOrder[(i + k) % nOrder];
                 if (Present_FgModeAvailable(m)) {
                     next = m;
                     break;
@@ -3094,10 +3285,11 @@ static void OsdBuild(OvList& L, UINT w, UINT h, int px, float alpha) {
         if (g_osd.what != OSD_DXVK) text += L" (" + MenuKeyLabel() + L")";
         warn = true;
     } else if (g_osd.what == OSD_WARN_B || g_osd.what == OSD_SAVE_FAIL || g_osd.what == OSD_WARN_MSAA ||
-        g_osd.what == OSD_FG_RESTART) {
+        g_osd.what == OSD_FG_RESTART || g_osd.what == OSD_FG_SUBST) {
         text = Tr(g_osd.what == OSD_WARN_B      ? S_OSD_WARN_B
                   : g_osd.what == OSD_WARN_MSAA ? S_OSD_WARN_MSAA
                   : g_osd.what == OSD_FG_RESTART ? S_OSD_FG_RESTART
+                  : g_osd.what == OSD_FG_SUBST ? S_OSD_FG_SUBST
                                                 : S_OSD_SAVE_FAIL);
         warn = true;
     } else if (g_osd.what == OSD_HINT) {
@@ -3149,7 +3341,7 @@ static std::wstring OverlayVersionsText() {
         fg = Tr(S_OV_FG_OFF);
     } else if (fi.state == BMSD_FGS_ACTIVE && *fi.name) {
         wchar_t m[16];
-        if (fi.activeMode == BMSD_FG_FSRADAPT)  // adaptivni: zadny pevny nasobek - skutecny pomer vystup / hra
+        if (fi.activeMode == BMSD_FG_FSRADAPT || fi.activeMode == BMSD_FG_DLSSGADAPT)  // adaptivni: zadny pevny nasobek - skutecny pomer vystup / hra
             swprintf(m, 16, fi.realFps > 1 && fi.outFps > fi.realFps ? L" ~%.1f×" : L"",
                      (double)fi.outFps / (double)(fi.realFps > 1 ? fi.realFps : 1));
         else
@@ -3165,7 +3357,55 @@ static std::wstring OverlayVersionsText() {
 // jedno cislo) a pod nim radek s verzemi ([menu] OverlayVersions; kazdy jde i sam). Kresli se do backbufferu po
 // kopii HUD-less (= UI, generator ho neposouva se scenou); s FG prezentuje helper i generovane snimky, cisla FPS jsou
 // z jeho citacu (Present_FpsGet). Pridava do L (za OSD).
-static void CornerBuild(OvList& L, UINT w, UINT h, int px, bool fps, bool ver) {
+// v103g: diagnostika plynulosti ([menu] DiagOverlay) - cislo s desetinnou carkou (cestina)
+static std::wstring DgNum(double v, int dec) {
+    wchar_t b[32];
+    swprintf(b, 32, L"%.*f", dec, v);
+    if (g_menuCfg.lang == 0)
+        for (wchar_t* p = b; *p; ++p)
+            if (*p == L'.') *p = L',';
+    return b;
+}
+// Radek stavu FG pro diagnostiku: "FG ~2,0× · generuje · <duvod>", "FG · jen skutecne · <duvod>", "FG vyp"
+static std::wstring DiagFgText() {
+    PresentFgInfo fi;
+    Present_FgInfo(&fi);
+    if (fi.requested == BMSD_FG_OFF || !fi.presenter || fi.fallback || !fi.helperReady) return Tr(S_OV_FG_OFF);
+    if (fi.state != BMSD_FGS_ACTIVE)
+        return (*fi.name ? MenuW(fi.name) : std::wstring(L"FG")) + L" (" + Tr(S_OV_PAUSED) + L")";
+    const bool adapt = fi.activeMode == BMSD_FG_FSRADAPT || fi.activeMode == BMSD_FG_DLSSGADAPT;
+    if (!adapt) return L"FG " + DgNum(fi.activeMult >= 2 ? fi.activeMult : 2, 0) + L"× · " + Tr(S_PFS_GEN);
+    wchar_t r[160];
+    FgPrefInfo(r, 160);
+    PresentFgPref pi;
+    Present_FgPrefInfo(&pi);
+    std::wstring m = L"FG";
+    if (pi.gen && fi.realFps > 1.0f && fi.outFps > fi.realFps) m += L" ~" + DgNum((double)fi.outFps / fi.realFps, 1) + L"×";
+    return m + L" · " + r;
+}
+// Graf intervalu obrazu na monitoru (sloupce, nejnovejsi vpravo): vyska = interval, mez nahore 2,5 x median; mimo pasmo
+// 0,75-1,33 x median zlute, nad 2,5 x cervene; tenka cara = median.
+static void DiagGraph(OvList& L, int x0, int y0, int x1, int y1, const PresentDiag& d, const MenuColors& C) {
+    const OvSprite& row = g_ovAtlas.spr[OVS_ROW];
+    OvNine(L, x0, y0, x1, y1, row, C.panel, true);
+    const int pad = std::max(2, (int)row.n);
+    const int gx0 = x0 + pad, gx1 = x1 - pad, gy0 = y0 + pad, gy1 = y1 - pad;
+    if (gx1 - gx0 < 8 || gy1 - gy0 < 8 || d.n <= 0 || d.ivMed <= 0.0f) return;
+    const int bw = std::max(2, (gx1 - gx0) / 150);
+    const int nb = std::min(d.n, (gx1 - gx0) / bw);
+    const double top = 2.5 * d.ivMed;
+    const int ym = gy1 - (int)lround((gy1 - gy0) * (d.ivMed / top));
+    OvRect(L, gx0, ym, gx1, ym + 1, C.dim);
+    for (int i = 0; i < nb; ++i) {
+        const float v = d.iv[d.n - nb + i];
+        const int hgt = std::max(1, (int)lround((gy1 - gy0) * std::min(1.0, v / top)));
+        const int bx = gx1 - (nb - i) * bw;
+        const DWORD col = v > 2.5f * d.ivMed ? C.err : v > 1.33f * d.ivMed || v < 0.75f * d.ivMed ? C.warn : C.accent;
+        OvRect(L, bx, gy1 - hgt, bx + bw - (bw > 2 ? 1 : 0), gy1, col);
+    }
+}
+
+static void CornerBuild(OvList& L, UINT w, UINT h, int px, bool fps, bool ver, bool dg) {
     wchar_t ftext[48] = L"";
     if (fps) {
         float real = 0, total = 0;
@@ -3175,7 +3415,9 @@ static void CornerBuild(OvList& L, UINT w, UINT h, int px, bool fps, bool ver) {
         else swprintf(ftext, 48, L"FPS %ld", lroundf(total));
     }
     const std::wstring vtext = ver ? OvFit(OVF_REG, OverlayVersionsText(), (int)w / 2) : std::wstring();
-    if (!fps && vtext.empty()) return;
+    PresentDiag dd;
+    if (dg && !Present_DiagGet(&dd)) dg = false;
+    if (!fps && vtext.empty() && !dg) return;
     const MenuColors C(1.0f);
     const int pad = px / 2, lineH = (int)lroundf((float)px * 1.4f);
     const int x1 = (int)w - px;
@@ -3191,6 +3433,29 @@ static void CornerBuild(OvList& L, UINT w, UINT h, int px, bool fps, bool ver) {
     };
     if (fps) line(ftext, C.text);
     if (!vtext.empty()) line(vtext.c_str(), C.dim);
+    if (dg) {  // v103g: diagnostika plynulosti
+        wchar_t t[160];
+        const std::wstring g = DgNum(dd.gameFps, 0), m = DgNum(dd.monFps, 0);
+        swprintf(t, 160, Tr(dd.presenter ? S_DG_L1 : S_DG_DXVK), g.c_str(), m.c_str());
+        line(t, C.text);
+        if (dd.presenter && dd.skipped >= 0) {
+            const int tot = dd.skipped + std::max(0, dd.shown);
+            const std::wstring pc = DgNum(tot > 0 ? 100.0 * dd.skipped / tot : 0.0, 1);
+            swprintf(t, 160, Tr(S_DG_L2), dd.skipped, pc.c_str());
+            line(t, dd.skipped > 0 ? C.warn : C.text);
+        } else {
+            line(Tr(S_DG_L2NA), C.dim);
+        }
+        line(OvFit(OVF_REG, DiagFgText(), (int)w / 2).c_str(), C.text);
+        const std::wstring a = DgNum(dd.ivMed, 1), b = DgNum(dd.ivSd, 2);
+        swprintf(t, 160, Tr(S_DG_IV), a.c_str(), b.c_str(), dd.ivShort, dd.ivLong);
+        line(t, dd.ivSd > 1.0f || dd.ivShort + dd.ivLong > 0 ? C.warn : C.text);
+        const int gw = std::min((int)w / 3, std::max(px * 14, 300)), gh = lineH * 3;
+        if (y + gh < (int)h && x1 - gw >= 0) {
+            DiagGraph(L, x1 - gw, y, x1, y + gh, dd, C);
+            y += gh + px / 4;
+        }
+    }
 }
 
 // Vsechno, co se ma kreslit pres obraz hry (menu nebo OSD), jako seznam ctyruhelniku pro cil w x h.
@@ -3213,7 +3478,8 @@ static bool OverlayBuild(IDirect3DDevice9* d, UINT w, UINT h) {
     bool fs;
     const bool fps = !M.open && g_menuCfg.fpsCounter && Present_FpsGet(&fr, &ft, &fs);
     const bool ver = !M.open && g_menuCfg.overlayVersions;
-    if (!M.open && !osd && !fps && !ver) return false;
+    const bool dg = !M.open && g_menuCfg.diag;
+    if (!M.open && !osd && !fps && !ver && !dg) return false;
     int px = MenuBasePx(h);
     if (M.open) {
         // pismo: zmensit, dokud se panel nevejde (az na 12 px), pak se seznam posouva
@@ -3240,7 +3506,7 @@ static bool OverlayBuild(IDirect3DDevice9* d, UINT w, UINT h) {
     if (!M.open) {
         if (osd) OsdBuild(M.list, w, h, px, osdA);
         else M.list.Clear();
-        if (fps || ver) CornerBuild(M.list, w, h, px, fps, ver);
+        if (fps || ver || dg) CornerBuild(M.list, w, h, px, fps, ver, dg);
         M.dirty = true;  // menu se pri otevreni prestavi
     } else if (M.dirty || M.builtW != w || M.builtH != h || M.frames - M.builtFrame >= 20) {
         MenuBuild(M.list, w, h, px);
@@ -3304,7 +3570,8 @@ static void MenuSaveShot(IDirect3DDevice9* d, IDirect3DSurface9* bb, const D3DSU
 static void MenuFrameDraw(IDirect3DDevice9* d) {
     MenuState& M = g_menu;
     if (g_menuCfg.fpsCounter && g_menuCfg.enable) Present_FpsTick();  // ukazatel FPS: pocitat kazdy snimek
-    const bool corner = (g_menuCfg.fpsCounter || g_menuCfg.overlayVersions) && g_menuCfg.enable;
+    Present_DiagTick(g_menuCfg.diag && g_menuCfg.enable);             // v103g: diagnostika plynulosti (casy Present)
+    const bool corner = (g_menuCfg.fpsCounter || g_menuCfg.overlayVersions || g_menuCfg.diag) && g_menuCfg.enable;
     if ((!M.open && !M.shotPending && g_osd.what < 0 && !corner) || !d) return;
     if (OverlayPickSink() != SINK_BACKBUFFER) return;  // SINK_LAYER: az s Frame Generation
     // (originalni funkce zarizeni zna proxy az po HookDevice; bez nich se nekresli a menu se samo zavre nize)

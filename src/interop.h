@@ -13,9 +13,15 @@ void ProxyPartBPerf(char* buf, size_t n);
 // Regulator latence (proxy.cpp / latency.inl): cast radku "vykon" - rezim, podil aktivnich snimku, fronta, spanek,
 // odhad latence; prazdny retezec pri [latency] Mode=0. Volani pocitadla vynuluje.
 void ProxyLatencyPerf(char* buf, size_t n);
+// Cas GPU posledniho snimku hry s prectenymi casovymi znackami D3D9 (latency.inl; ms, seq se meni s novou hodnotou).
+// Jen z vlakna renderu.
+float ProxyLatGpuSpanMs(uint32_t* seq);
 // Maska reaktivity (proxy.cpp / reactive.inl): cast radku "vykon" - podil snimku s maskou, draw na snimek, CPU;
 // prazdny retezec pri [upscale] ReactiveMask=0. Volani pocitadla vynuluje.
 void ProxyReactivePerf(char* buf, size_t n);
+// Kamera a mys (proxy.cpp / menu.inl): otaceni kamery hlavniho pohledu a raw input mysi vyzvednuty vlaknem hry za
+// interval radku "vykon", stav kurzoru. Volani pocitadla vynuluje.
+void ProxyCamInputPerf(char* buf, size_t n);
 
 struct SceneEndInfo {
     IDirect3DDevice9* dev;

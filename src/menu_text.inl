@@ -62,11 +62,30 @@
       L"On: no frame generation while this menu is open (no menu artifacts). Off: FG changes and frame counts "      \
       L"show immediately.")                                                                                          \
     X(S_IT_FG_STATE, L"Stav", L"Status")                                                                             \
+    X(S_IT_FG_PREF, L"Kdy generovat", L"When to generate")                                                           \
+    X(S_IT_FG_PREFFPS, L"Vlastní: generovat pod", L"Custom: generate below")                                         \
+    X(S_IT_FG_PREFSTATE, L"Rozhodnutí", L"Decision")                                                                 \
     X(S_IT_LATENCY, L"Snížení latence", L"Latency reduction")                                                      \
     X(S_IT_FPSCOUNTER, L"Ukazatel FPS", L"FPS counter")                                                              \
     X(S_IT_OVERLAYVER, L"Zobrazit verze", L"Show versions")                                                          \
     X(S_OV_FG_OFF, L"FG vyp", L"FG off")                                                                             \
     X(S_OV_PAUSED, L"pauza", L"paused")                                                                              \
+    X(S_IT_DIAG, L"Diagnostika plynulosti", L"Smoothness diagnostics")                                               \
+    X(S_IT_DG_GAME, L"  Hra", L"  Game")                                                                             \
+    X(S_IT_DG_MON, L"  Monitor", L"  Monitor")                                                                       \
+    X(S_IT_DG_SKIP, L"  Přeskočeno", L"  Skipped")                                                                   \
+    X(S_IT_DG_FG, L"  FG", L"  FG")                                                                                  \
+    X(S_IT_DG_GRAPH, L"  Graf", L"  Graph")                                                                          \
+    X(S_DG_GAME_TXT, L"FPS vykreslené hrou", L"FPS rendered by the game")                                            \
+    X(S_DG_MON_TXT, L"obrazy/s na monitoru, i generované", L"frames/s on the monitor, incl. generated")              \
+    X(S_DG_SKIP_TXT, L"hotové obrazy, které monitor nedostal (~1 s)", L"finished frames the monitor never got (~1 s)") \
+    X(S_DG_FG_TXT, L"generuje N× / jen skutečné a proč", L"generating N× / real frames only, and why")                \
+    X(S_DG_GRAPH_TXT, L"mezery mezi obrazy na monitoru; plynulé = rovná čára", L"gaps between frames on the monitor; smooth = flat line")     X(S_IT_DG_OUT, L"  Krátké / dlouhé", L"  Short / long")                                                             X(S_DG_OUT_TXT, L"intervaly < 0,75× / > 1,33× mediánu za ~1 s (cíl 0)", L"gaps < 0.75× / > 1.33× the median, last ~1 s (aim: 0)") \
+    X(S_DG_L1, L"Hra %ls · Monitor %ls FPS", L"Game %ls · Monitor %ls FPS")                                          \
+    X(S_DG_DXVK, L"Hra %ls · Monitor %ls FPS (bez FG: Present DXVK)", L"Game %ls · Monitor %ls FPS (no FG: DXVK Present)") \
+    X(S_DG_L2, L"Přeskočeno %d / s (%ls %%)", L"Skipped %d / s (%ls%%)")                                             \
+    X(S_DG_L2NA, L"Přeskočeno n/a (bez FG)", L"Skipped n/a (no FG)")                                                 \
+    X(S_DG_IV, L"Interval %ls ms · sd %ls · krátké %d / dlouhé %d", L"Interval %ls ms · sd %ls · short %d / long %d") \
     X(S_IT_INPUT, L"Vstup DLSS", L"DLSS input")                                                                      \
     X(S_IT_DEPTH, L"Hloubka pro DLSS", L"Depth for DLSS")                                                            \
     X(S_IT_PHASES, L"Fáze jitteru", L"Jitter phases")                                                                \
@@ -98,6 +117,7 @@
     X(S_FG_DLSSG, L"DLSS-G", L"DLSS-G")                                                                              \
     X(S_FG_FSR2X, L"FSR", L"FSR")                                                                                     \
     X(S_FG_FSRADAPT, L"FSR adaptivní", L"FSR adaptive")                                                              \
+    X(S_FG_DLSSGADAPT, L"DLSS-G adaptivní", L"DLSS-G adaptive")                                                      \
     X(S_FGS_ACTIVE, L"běží", L"running")                                                                             \
     X(S_FGS_STARTING, L"spouští se", L"starting")                                                                    \
     X(S_FGS_PAUSED, L"pozastaveno", L"paused")                                                                       \
@@ -106,6 +126,26 @@
     X(S_FGS_FAILED, L"selhalo – do restartu vypnuto", L"failed – off until restart")                                 \
     X(S_FGS_RESTART, L"po restartu hry", L"after game restart")                                                      \
     X(S_FGS_FALLBACK, L"záložní prezentace", L"fallback presentation")                                               \
+    X(S_PREF_RESP, L"Přednost odezvě", L"Responsiveness")                                                            \
+    X(S_PREF_BAL, L"Vyvážené", L"Balanced")                                                                          \
+    X(S_PREF_SMOOTH, L"Plynulost", L"Smoothness")                                                                    \
+    X(S_PREF_ALWAYS, L"Vždy", L"Always")                                                                             \
+    X(S_PREF_CUSTOM, L"Vlastní", L"Custom")                                                                          \
+    X(S_PREF_STEADY, L"Stálé FPS (ini)", L"Steady FPS (ini)")                                                        \
+    X(S_PFS_GEN, L"generuje", L"generating")                                                                         \
+    X(S_PFS_REAL, L"jen skutečné", L"real frames only")                                                              \
+    X(S_PFR_GEN, L"hra %ls FPS pod %ls, zisk +%ls %%", L"game %ls FPS below %ls, gain +%ls%%")                       \
+    X(S_PFR_ABOVE, L"hra %ls FPS nad prahem %ls", L"game %ls FPS above threshold %ls")                               \
+    X(S_PFR_GAIN, L"zisk jen %ls %% (min. %ls %%)", L"gain only %ls%% (min. %ls%%)")                                 \
+    X(S_PFR_TARGET, L"hra stíhá cíl sama (%ls FPS)", L"game meets the target (%ls FPS)")                             \
+    X(S_PFR_HOLD, L"hra %ls FPS, pásmo %ls–%ls: drží stav", L"game %ls FPS, band %ls–%ls: state kept")               \
+    X(S_PFR_ROUGH, L"hra bez FG ≥ %ls FPS (hrubý odhad), práh %ls", L"game without FG ≥ %ls FPS (rough estimate), threshold %ls") \
+    X(S_PFR_GUARD, L"pauza / menu: beze změny", L"pause / menu: unchanged")                                          \
+    X(S_PFR_USELESS, L"generování nepřidávalo, zkusí znovu", L"generating added nothing, will retry")               \
+    X(S_PFR_BLOCK, L"odhad nevyšel, chvíli generuje dál", L"estimate missed, keeps generating for now")              \
+    X(S_PFR_ALWAYS, L"Vždy: doplňuje do cíle", L"Always: fills up to the target")                                    \
+    X(S_PFR_NOEST, L"odhad FPS chybí – jako Vždy", L"no FPS estimate – acts as Always")                              \
+    X(S_PFR_WAIT, L"měří se…", L"measuring…")                                                                        \
     X(S_LAT_ADAPTIVE, L"adaptivní", L"adaptive")                                                                     \
     X(S_LAT_MEASURE, L"jen měření", L"measure only")                                                                 \
     X(S_IN_HDR, L"lineární HDR", L"linear HDR")                                                                      \
@@ -138,9 +178,11 @@
       L"FSR unavailable: Microsoft Visual C++ Redistributable x64 is missing.")                                        \
     X(S_NOTE_GPU_IGPU, L"Běží na integrované GPU – Windows Grafika: bms.exe → Vysoký výkon.",                             L"On integrated GPU – Windows Graphics: bms.exe → High performance.")                                              X(S_NOTE_GPU_NODLSS, L"GPU bez DLSS – Windows Grafika: bms.exe → Vysoký výkon.",                                       L"GPU without DLSS – Windows Graphics: bms.exe → High performance.")                                               X(S_NOTE_NOSAVE, L"Neukládá se.", L"Not saved.")                                                                 \
     X(S_NOTE_FG_MULT_FSR, L"FSR: jen 2× (vlastní generátor nejde vytvořit).", L"FSR: 2× only (own generator failed).") \
-    X(S_NOTE_FG_MULT_FSR5, L"FSR 3× až 5×: vlastní generátor; 6× jen DLSS-G.", L"FSR 3× to 5×: own generator; 6× DLSS-G only.") \
+    X(S_NOTE_FG_MULT_FSR5, L"FSR 3× až 6×: vlastní generátor.", L"FSR 3× to 6×: own generator.") \
+    X(S_NOTE_FG_DGADAPT_GPU, L"DLSS-G adaptivní jen na kartách s DLSS-G nad 2× (RTX 50); jinde FSR adaptivní.",       \
+      L"DLSS-G adaptive needs a GPU with DLSS-G above 2× (RTX 50); use FSR adaptive elsewhere.")                    \
     X(S_NOTE_FG_ADAPT_IDLE, L"Hra teď stíhá cíl – jen skutečné snímky.", L"The game meets the target – real frames only.") \
-    X(S_NOTE_FG_MULT_RTX50, L"DLSS-G 3×–6× jen RTX 50 (tato karta 2×); režim FSR umí až 5×.", L"DLSS-G 3×–6× RTX 50 only (this GPU: 2×); FSR mode does up to 5×.") \
+    X(S_NOTE_FG_MULT_RTX50, L"DLSS-G 3×–6× jen RTX 50 (tato karta 2×); režim FSR umí až 6×.", L"DLSS-G 3×–6× RTX 50 only (this GPU: 2×); FSR mode does up to 6×.") \
     X(S_NOTE_FG_MULT_AUTO2, L"Auto: tato karta umí jen 2×, auto drží 2×.", L"Auto: this GPU does 2× only, auto stays at 2×.") \
     X(S_NOTE_FG_MULT_MAX3, L"4× a víc: tato karta umí nejvýš 3×.", L"4× and up: this GPU does at most 3×.")           \
     X(S_NOTE_FG_MULT_MAX4, L"5× a 6×: tato karta umí nejvýš 4×.", L"5× and 6×: this GPU does at most 4×.")             \
@@ -180,24 +222,34 @@
       L"Experimental: smaller render, the mod patches engine effects. F4 or dlss_q / dlss_b / dlss_nat.")            \
     X(S_HELP_LIGHTSB, L"Opravy světel, stínu slunce, částic a refrakce, když hra kreslí zmenšený obraz.",            \
       L"Fixes lights, sun shadow, particles and refraction when the game renders at reduced resolution.")            \
-    X(S_HELP_FG, L"DLSS-G nebo FSR: hra kreslí část snímků, zbytek dopočítá GPU (násobek). Odezva je delší.",        \
-      L"DLSS-G or FSR: the game renders some frames, the GPU generates the rest. Latency is higher.")                \
-    X(S_HELP_FG_TARGET, L"Snímků zobrazených celkem (hra + generované); hra kreslí výstup / násobek. Auto = Hz − Hz²/3600.", \
-      L"Total frames shown (game + generated); the game renders output / multiplier. Auto = Hz − Hz²/3600.")       \
-    X(S_HELP_FG_TARGET_AD, L"Snímků zobrazených celkem; hra víc nekreslí, chybějící doplní FG. Auto = Hz − Hz²/3600.", \
-      L"Total frames shown; the game never renders more, FG fills the gap. Auto = Hz − Hz²/3600.")                 \
+    X(S_HELP_FG, L"DLSS-G nebo FSR: hra kreslí část snímků, zbytek dopočítá GPU (násobek; adaptivní = jen co chybí do cíle). Odezva je delší.", \
+      L"DLSS-G or FSR: the game renders some frames, the GPU generates the rest (adaptive = only what is missing to the target). Latency is higher.") \
+    X(S_HELP_FG_TARGET, L"Snímků celkem (hra + generované), hra kreslí výstup / násobek. Auto = Hz − Hz²/3600 (doporučeno); nad Hz se obraz může trhat.", \
+      L"Total frames (game + generated); the game renders output / multiplier. Auto = Hz − Hz²/3600 (recommended); above Hz the image may tear.") \
+    X(S_HELP_FG_TARGET_AD, L"Snímků celkem, chybějící doplní FG (nejvýš 6×). Auto = Hz − Hz²/3600 (doporučeno); nad Hz monitor celé neukáže, obraz se může trhat.", \
+      L"Total frames; FG fills the gap (6× at most). Auto = Hz − Hz²/3600 (recommended); above Hz frames are shown in part and the image may tear.") \
     X(S_HELP_FG_REALCAP, L"Hra sama kreslí nejvýš tolik FPS, zbytek do výstupu doplní FG. Vyp = nejmenší odezva.",     \
       L"The game itself renders at most this; FG fills up to the output. Off = lowest latency.")                   \
     X(S_HELP_FG_FILL, L"Generovat, až hra klesne pod tuto hranici (auto 90 % výstupu); nad 95 % nic.",     \
       L"Generate once the game drops below this (auto 90% of output); above 95% nothing.")             \
     X(S_HELP_FG_STATE, L"Skutečné + generované = zobrazené FPS a čas generátoru na snímek. Při otevřeném menu jen s Pozastavit v menu.",   \
       L"Rendered + generated = displayed FPS and generator time per frame. Paused in the menu only with Pause in menu.")       \
+    X(S_HELP_FG_PREF, L"Generovat jen pod prahem FPS hry v % cíle: odezva 50, vyvážené 75, plynulost 85; Vždy = do cíle vždy.", \
+      L"Generate only below a game FPS threshold in % of the target: 50 / 75 / 85; Always = always fill.")             \
+    X(S_HELP_FG_PREFFPS, L"Vlastní práh: generovat, jen když hra bez generování jede pod tolik % cíle.",                \
+      L"Custom threshold: generate only while the game runs below this % of the target without it.")                       \
+    X(S_HELP_FG_PREFSTATE, L"Proč adaptivní režim teď generuje, nebo ne (FPS hry bez generování, práh, zisk).",     \
+      L"Why the adaptive mode generates now or not (game FPS without generation, threshold, gain).")                \
     X(S_HELP_FG_MULT, L"Zobrazené snímky na 1 skutečný. Víc = méně skutečných, delší odezva; pro 240 Hz+ a úsporu.", \
       L"Displayed frames per rendered one. More = fewer real frames, more latency; for 240 Hz+.")                    \
     X(S_HELP_FPSCOUNTER, L"Malý řádek vpravo nahoře: skutečné / zobrazené FPS (bez FG jedno číslo).",                \
       L"Small line top-right: real / displayed FPS (one number without FG).")                                        \
     X(S_HELP_OVERLAYVER, L"Řádek vpravo nahoře: běžící upscaler a FG s verzí a násobkem (i bez ukazatele FPS).",     \
       L"Line top-right: running upscaler and FG with version and multiplier (also without FPS).")                    \
+    X(S_HELP_DIAG, L"Vpravo nahoře čísla a graf: co hra vykreslí a co opravdu jde na monitor. Popis níže.",          \
+      L"Top-right numbers and graph: what the game renders and what really reaches the monitor. See below.")         \
+    X(S_HELP_DG, L"Význam čísla v diagnostice plynulosti (vpravo nahoře).",                                          \
+      L"Meaning of this number in the smoothness diagnostics (top-right).")                                          \
     X(S_HELP_LATENCY, L"Když hru brzdí grafická karta, mod zkrátí frontu snímků a odezva je rychlejší (podobné NVIDIA Reflex).",        \
       L"When the GPU is the bottleneck, the mod shortens the frame queue for faster input (similar to NVIDIA Reflex).")           \
     X(S_HELP_INPUT, L"Jak DLSS dostává barvu: LDR (8 bit), lineární HDR, s auto expozicí, nebo s inverzním TM.",     \
@@ -227,8 +279,8 @@
     X(S_HELP_SCALE, L"Velikost textu menu a OSD.", L"Text size of the menu and OSD.")                                \
     X(S_HELP_MENUPOS, L"Kam se menu kreslí – mimo střed zůstane obraz volný pro porovnání nastavení.",                \
       L"Where the menu is drawn – off-center leaves the picture free for comparing settings.")                      \
-    X(S_HELP_TESTKEYS, L"Alt+F9: FG vyp → DLSS-G → FSR. Alt+F10: DLSS ↔ FSR. Změny z kláves se neukládají.",       \
-      L"Alt+F9: FG off → DLSS-G → FSR. Alt+F10: DLSS ↔ FSR. Changes made with these keys are not saved.")         \
+    X(S_HELP_TESTKEYS, L"Alt+F9: režimy FG dokola (pořadí jako v menu). Alt+F10: DLSS ↔ FSR. Změny z kláves se neukládají.", \
+      L"Alt+F9: cycles FG modes (menu order). Alt+F10: DLSS ↔ FSR. Changes made with these keys are not saved.")   \
     /* OSD */                                                                                                        \
     X(S_OSD_WARN_B, L"DLSS nedopočítává zmenšený render – zapni DLSS (Alt+F8) nebo mat_viewportscale 1",             \
       L"DLSS is not upscaling the reduced render – enable DLSS (Alt+F8) or set mat_viewportscale 1")                \
@@ -239,6 +291,8 @@
     X(S_OSD_HINT, L"Nastavení modu bms-dlss: ", L"bms-dlss settings: ")                                              \
     X(S_OSD_FG_RESTART, L"Frame Generation vyžaduje restart – zapni ji v menu a restartuj hru",                      \
       L"Frame Generation requires a restart – turn it on in the menu and restart the game")                         \
+    X(S_OSD_FG_SUBST, L"DLSS-G adaptivní na této kartě není (jen RTX 50) – použit náhradní režim FG",                \
+      L"DLSS-G adaptive is not available on this GPU (RTX 50 only) – using a substitute FG mode")                   \
     X(S_OSD_FAIL_FG, L"Frame Generation selhala – vypnuta do restartu hry, podrobnosti v bms_dlss.log",               \
       L"Frame Generation failed – off until the game restarts, details in bms_dlss.log")                            \
     X(S_OSD_FAIL_FG_RETRY, L"Frame Generation se nestihla spustit – nový pokus: vypni a zapni ji v menu",           \

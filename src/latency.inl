@@ -65,6 +65,12 @@ static struct {
     unsigned framesOk, dwell;
     LONGLONG cooldownUntil;
     double penaltyS = 5.0;
+    LONGLONG penaltyQ;          // posledni vypnuti s trestem (trest klesa: polovina za kazdych 60 s bez dalsiho)
+    double lastIv;              // interval Present -> Present tohoto snimku (zaskub = nad 3x intEwma, timeout bez trestu)
+    // okraj z minuleho zapnuti (nabeh po prepnuti FG, v103b): naucena hodnota, cas vypnuti, posledni okno bez hladu GPU
+    double mLearned;
+    LONGLONG mLearnedQ;
+    bool mLearnedOk, lastWinOk;
     unsigned winFrames, winStarved;
     double winLostMs, winMs;
     unsigned strikes;
@@ -250,6 +256,14 @@ static void LatError(const char* what, HRESULT hr) {
 
 // Casove znacky dokonceneho snimku (az po eventu: pak uz jsou zapsane, GetData hned uspeje)
 // true = znacky jeste nejsou k dispozici (dalsi snimky pak necist, mezera se pocita v poradi)
+// Posledni precteny cas GPU snimku hry (casova znacka po Present -> pred dalsim Present; pro odhad FG, src/fgest.inl)
+static float g_latSpanMs;
+static uint32_t g_latSpanSeq;
+float ProxyLatGpuSpanMs(uint32_t* seq) {
+    *seq = g_latSpanSeq;
+    return g_latSpanMs;
+}
+
 static bool LatReadTs(LatSlot& s) {
     if (!s.tsPending) return false;
     UINT64 e = 0, b = 0;
@@ -263,9 +277,12 @@ static bool LatReadTs(LatSlot& s) {
         return false;
     }
     s.tsE = e;
+    if (g_lat.tsTicksPerMs > 0.0) Lc_GpuFrame(s.tSubmit, (double)e / g_lat.tsTicksPerMs, s.tDone);
     if (s.begIssued && e >= b) {
         g_latSt.gpuSum += (double)(e - b) / g_lat.tsTicksPerMs;
         ++g_latSt.gpuN;
+        g_latSpanMs = (float)((double)(e - b) / g_lat.tsTicksPerMs);
+        ++g_latSpanSeq;
     }
     // necinnost GPU mezi koncem predchoziho a zacatkem tohoto snimku
     if (s.begIssued && g_lat.lastTsEValid && g_lat.lastTsEN + 1 == s.n && b >= g_lat.lastTsE) {
@@ -403,6 +420,12 @@ static unsigned LatPop(uint64_t v) {
 
 static void LatDisengage(const char* why, double penaltyS) {
     if (g_lat.state != LS_ACTIVE) return;
+    // naucany okraj pro dalsi zapnuti (FG zap / vyp, menu s pauzou FG): jen z aspon jednoho celeho okna 64 snimku
+    if (g_lat.dwell >= 64) {
+        g_lat.mLearned = g_lat.margin;
+        g_lat.mLearnedQ = LatQpc();
+        g_lat.mLearnedOk = g_lat.lastWinOk && penaltyS <= 0.0;
+    }
     g_lat.state = LS_IDLE;
     g_lat.D = 0.0;
     g_lat.dwell = 0;
@@ -410,9 +433,18 @@ static void LatDisengage(const char* why, double penaltyS) {
     ++g_latSt.disengage;
     g_latSt.lastReason = why;
     const LONGLONG now = LatQpc();
-    // trest roste pri opakovani (10 -> 20 -> ... 120 s); bez trestu jen 2 s proti preskakovani tam a zpet
+    // trest roste pri opakovani (10 -> 20 -> ... 120 s) a klesa: za kazdych 60 s od posledniho vypnuti s trestem na
+    // polovinu (nejmene 5 s) - jinak by po nekolika zaskubech (nacitani, HDD) byl Impulse po zbytek sezeni skoro stale
+    // vypnuty. Bez trestu jen 2 s proti preskakovani tam a zpet.
+    if (penaltyS > 0.0 && g_lat.penaltyQ) {
+        for (double el = LatMs(g_lat.penaltyQ, now); el >= 60000.0 && g_lat.penaltyS > 5.0; el -= 60000.0)
+            g_lat.penaltyS = std::max(5.0, g_lat.penaltyS * 0.5);
+    }
     const double wait = penaltyS > 0.0 ? std::max(penaltyS, g_lat.penaltyS) : 2.0;
-    if (penaltyS > 0.0) g_lat.penaltyS = std::min(120.0, wait * 2.0);
+    if (penaltyS > 0.0) {
+        g_lat.penaltyS = std::min(120.0, wait * 2.0);
+        g_lat.penaltyQ = now;
+    }
     g_lat.cooldownUntil = LatAddMs(now, wait * 1000.0);
     if (LatStateLogOk()) Log("latence: regulator vypnut (%s), dalsi pokus nejdriv za %.0f s", why, wait);
 }
@@ -454,8 +486,10 @@ static void LatBeforePresent(IDirect3DDevice9* d) {
             g_lat.cEwma += 0.05 * (c - g_lat.cEwma);
         }
     }
+    g_lat.lastIv = 0.0;
     if (g_lat.lastSubmit) {
         const double iv = LatMs(g_lat.lastSubmit, now);
+        g_lat.lastIv = iv;
         if (iv > 0.0 && iv < 500.0) {
             g_lat.intEwma = g_lat.intEwma <= 0.0 ? iv : g_lat.intEwma + 0.05 * (iv - g_lat.intEwma);
             if (g_lat.state == LS_ACTIVE) g_lat.winMs += iv;
@@ -521,7 +555,14 @@ static void LatAfterPresent(IDirect3DDevice9* d, HRESULT hr) {
             g_lat.dwell = 0;
             g_lat.D = 0.0;
             g_lat.slackBits = 0;
-            g_lat.margin = g_lat.marginMinMs;
+            // Nabeh (v103b): driv okraj vzdy od minima 0,5 ms -> po kazdem prepnuti FG (vypnuti generovani, menu s
+            // pauzou FG) integrator z cekani ~6 ms rychle narostl na plny spanek, GPU 1-1,5 s hladovelo a FPS klesly
+            // o 5-20 %. Ted zacina z horni meze okraje (0,3 intervalu) a klesa jen v oknech bez hladu (x0,95 za 64
+            // snimku); naucany okraj z minuleho zapnuti do 60 s (bez hladu v poslednim okne) se prevezme.
+            const double mTop = std::max((double)g_lat.marginMinMs, 0.3 * g_lat.intEwma);
+            const bool take = g_lat.mLearnedOk && g_lat.mLearnedQ && LatMs(g_lat.mLearnedQ, now) < 60000.0;
+            g_lat.margin = take ? std::min(mTop, std::max((double)g_lat.marginMinMs, g_lat.mLearned)) : mTop;
+            g_lat.lastWinOk = false;
             g_lat.wMad = 0.0;
             g_lat.winFrames = g_lat.winStarved = 0;
             g_lat.winLostMs = g_lat.winMs = 0.0;
@@ -529,8 +570,8 @@ static void LatAfterPresent(IDirect3DDevice9* d, HRESULT hr) {
             g_lat.wPresEwma = 0.0;
             ++g_latSt.engage;
             if (LatStateLogOk())
-                Log("latence: regulator zapnut (GPU je uzke hrdlo: snimek %.2f ms, CPU %.2f ms, okraj %.2f ms)",
-                    g_lat.intEwma, g_lat.cEwma, g_lat.margin);
+                Log("latence: regulator zapnut (GPU je uzke hrdlo: snimek %.2f ms, CPU %.2f ms, okraj %.2f ms - %s)",
+                    g_lat.intEwma, g_lat.cEwma, g_lat.margin, take ? "prevzaty z minuleho zapnuti" : "nabeh od horni meze");
         }
     }
 
@@ -545,7 +586,8 @@ static void LatAfterPresent(IDirect3DDevice9* d, HRESULT hr) {
         bool waited = false, timeout = false;
         if (havePrev && p.evPending) {
             const LONGLONG t0 = now;
-            const double limit = std::min(100.0, std::max(20.0, 4.0 * g_lat.intEwma));
+            // limit podle intervalu snimku (pomale PC: pod 10 FPS je cekani na predchozi snimek bezne pres 100 ms)
+            const double limit = std::min(250.0, std::max(20.0, 4.0 * g_lat.intEwma));
             for (;;) {
                 const LONGLONG t = LatQpc();
                 if (LatDone(p, t)) {
@@ -571,7 +613,7 @@ static void LatAfterPresent(IDirect3DDevice9* d, HRESULT hr) {
         if (havePrev && !timeout) {
             const double wp = p.tDone > cur.tSubmit ? LatMs(cur.tSubmit, p.tDone) : 0.0;
             g_lat.wPresEwma += 0.1 * (wp - g_lat.wPresEwma);
-            w = g_lat.seWait + wp;
+            w = g_lat.seWait + wp + Present_BpWaitMs();  // v103g: + cekani zpetneho tlaku ([debug] PrefBpReg)
             waited = w > 0.0;
         }
         if (timeout) {
@@ -579,9 +621,11 @@ static void LatAfterPresent(IDirect3DDevice9* d, HRESULT hr) {
             if (!g_lat.warnedTimeout) {
                 g_lat.warnedTimeout = true;
                 Log("WARN: latence: GPU nedokoncilo snimek do %.0f ms - regulator vypnut (dalsi jen v radku vykon)",
-                    std::min(100.0, std::max(20.0, 4.0 * g_lat.intEwma)));
+                    std::min(250.0, std::max(20.0, 4.0 * g_lat.intEwma)));
             }
-            LatDisengage("timeout cekani na GPU", 10.0);
+            // Zaskub (interval snimku nad 3x prumer: nacitani, autosave, HDD) neni chyba regulatoru: bez trestu
+            const bool hitch = g_lat.intEwma > 0.0 && g_lat.lastIv > 3.0 * g_lat.intEwma;
+            LatDisengage(hitch ? "timeout cekani na GPU pri zaskubu" : "timeout cekani na GPU", hitch ? 0.0 : 10.0);
         } else if (!g_lat.broken) {
             if (waited) {
                 ++g_latSt.waited;
@@ -599,12 +643,15 @@ static void LatAfterPresent(IDirect3DDevice9* d, HRESULT hr) {
             g_lat.D = std::min(dMax, std::max(0.0, g_lat.D));
             const bool slack = g_lat.D < 0.05 && (!waited || w < 0.5 * g_lat.margin);
             g_lat.slackBits = (g_lat.slackBits << 1) | (slack ? 1u : 0u);
-            // 2) spanek: dalsi snimek zacne co nejpozdeji
+            // 2) spanek: dalsi snimek zacne co nejpozdeji. SampleSync: spi pumpa zprav hlavniho vlakna D ms od
+            //    odberu znacky tohoto snimku (pred odberem vstupu), vlakno renderu snimek hned uvolni.
             if (g_lat.D > 0.0) {
-                LatSleepUntil(LatAddMs(now, g_lat.D));
+                if (!Ss_Delay(g_lat.D)) {
+                    LatSleepUntil(LatAddMs(now, g_lat.D));
+                    now = LatQpc();
+                }
                 g_latSt.dSum += g_lat.D;
                 if (g_lat.D > g_latSt.dMax) g_latSt.dMax = g_lat.D;
-                now = LatQpc();
             }
             // 3) okno 64 snimku: pojistka proti hladu GPU (ztrata FPS) a vypnuti, kdyz GPU uz neni uzke hrdlo
             if (++g_lat.winFrames >= 64) {
@@ -624,6 +671,7 @@ static void LatAfterPresent(IDirect3DDevice9* d, HRESULT hr) {
                     if (g_lat.winStarved == 0 && lostFrac < 0.001) g_lat.margin = std::max(mMin, g_lat.margin * 0.95);
                     else g_lat.margin = std::max(mMin, g_lat.margin);
                 }
+                g_lat.lastWinOk = !bad;
                 g_lat.winFrames = g_lat.winStarved = 0;
                 g_lat.winLostMs = g_lat.winMs = 0.0;
                 if (g_lat.strikes >= 3) LatDisengage("GPU ma hlad i s nejvetsim okrajem", 30.0);
@@ -657,6 +705,7 @@ static void LatSetMode(int mode, Src src) {
     if (g_lat.state == LS_ACTIVE) LatDisengage("rezim zmenen", 0.0);
     g_lat.cooldownUntil = 0;
     g_lat.penaltyS = 5.0;
+    g_lat.mLearnedQ = 0;
     g_lat.broken = false;
     g_lat.warnedErr = g_lat.warnedTimeout = g_lat.warnedRing = false;
     SrcBeep(src, g_lat.mode == LAT_ADAPTIVE ? MB_OK : g_lat.mode == LAT_MEASURE ? MB_ICONASTERISK : MB_ICONHAND);

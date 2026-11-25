@@ -27,7 +27,7 @@ HWND Present_OnPresent(IDirect3DDevice9* dev, IDirect3DSwapChain9* sc, HWND over
 void Present_AfterPresent(IDirect3DDevice9* dev, bool isMain);
 
 // ---- Frame Generation (od BMSD_VERSION 12; [fg] Mode != 0 pri startu hry = prezentuje hlavni helper) ----
-// Rezimy jsou BMSD_FG_* z bmsd_shared.h (0 vyp, 1 DLSS-G, 2 FSR 2x, 3 FSR adaptivni), stavy BMSD_FGS_*.
+// Rezimy jsou BMSD_FG_* z bmsd_shared.h (0 vyp, 1 DLSS-G, 2 FSR 2x, 3 FSR adaptivni, 4 DLSS-G adaptivni), stavy BMSD_FGS_*.
 // Pozadovany rezim (ini pri startu, pak menu). SetMode: plati za behu (vyp <-> FG zapne / zastavi presenter pri
 // nejblizsim Present, [fg] LiveSwitch); jen kdyz zarizeni hry neni presmerovane, plati po restartu hry.
 int Present_FgGetMode();
@@ -37,6 +37,7 @@ bool Present_FgPresenterActive();
 bool Present_FgRetryable();  // zaloha z casoveho limitu startu: vyp / zap FG = novy pokus
 // Frame Generation presla za behu do zalohy (jednou true, pak false): proxy ukaze OSD
 int Present_TakeFallbackNote();  // 0 = nic, 1 = FG selhala, 2 = jen casovy limit startu (jde znovu)
+int Present_TakeFgSubstNote();   // 0 = nic, jinak 1 + nahradni rezim za nedostupny DLSS-G adaptivni (jednou)
 // Bezpecny start: pred Present_LoadConfig - duvod (minule spusteni skoncilo chybou), "" = ne. SafeStartHit = FG
 // pro tento start vypnuta
 void Present_SetSafeStart(const char* why);
@@ -50,6 +51,7 @@ bool Present_FgGetPauseInMenu();
 void Present_FgSetPauseInMenu(bool on);
 // Strop / cil vystupu [fg] TargetFps (0 = auto z obnovovaci frekvence monitoru f - f^2/3600, jako Reflex: 165 -> 157,4);
 // hra pri generovani N x bezi na 1/N (minus rezerva LimiterMargin).
+static const int kFgTargetMax = 9999;  // nejvyssi rucni cil (jen mez zapisu, zadny strop zobrazeni)
 int Present_FgGetTargetFps();
 void Present_FgSetTargetFps(int fps);
 // Nasobek FG 2 / 3 / 4 ([fg] Multiplier): pozadovany (helper ho omezi podle generatoru a GPU). MultMax(mode) =
@@ -73,8 +75,27 @@ void Present_FgSetFillBelow(int fps);
 // split = v okne byly generovane snimky. false = zatim nic.
 void Present_FpsTick();
 bool Present_FpsGet(float* real, float* total, bool* split);
+// Diagnosticky prekryv ([menu] DiagOverlay, v103g): Tick kazdy Present hlavniho zarizeni (jen se zapnutym prekryvem),
+// Get = posledni ~1 s: FPS hry, obrazy na monitoru (presenter FG v procesu hry, bez nej Present DXVK), preskocene obrazy
+// presenteru a intervaly obrazu na monitoru (nejnovejsi posledni). false = zatim nic.
+struct PresentDiag {
+    float gameFps, monFps;  // Present hry za s; obrazy na monitoru za s (vcetne generovanych)
+    bool presenter;         // monitor = presenter FG v procesu hry (false = Present DXVK)
+    int skipped, shown;     // presenter: preskoceno / zobrazeno za ~1 s (-1 = nevi se)
+    float ivMed, ivSd;      // interval obrazu na monitoru za ~1 s: median a smerodatna odchylka (ms)
+    int ivShort, ivLong;    // za ~1 s: intervaly < 0,75 x a > 1,33 x median (jednotlive kratke / dlouhe = viditelne skubnuti)
+    int n;                  // platnych intervalu v iv
+    float iv[200];          // intervaly za posledni ~2 s (ms), nejnovejsi posledni
+};
+void Present_DiagTick(bool on);  // on = prekryv zapnuty (jinak jen vypne sber)
+bool Present_DiagGet(PresentDiag* o);
 // Limiter FG v poslednich 64 snimcich spal aspon v 8: strop drzi mod, regulator latence (latency.inl) ma jen merit.
 bool Present_FgLimiting();
+// v103g ([debug] PrefBpReg): cekani zpetneho tlaku v tomto Present (ms, 0 = bez nej) - regulator latence ho pocita jako
+// cekani na GPU, takze spi pred dalsim snimkem (pred odberem vstupu) misto aby hotovy snimek cekal pred predanim
+double Present_BpWaitMs();
+// Konec Present hry na vlakne renderu (po vsech spancich proxy): hlavni vlakno hry muze pokracovat (src/gamethreads.inl).
+void Present_FrameReleased();
 // Stav pro menu (stavovy radek) a log. Retezce jsou ASCII (cesky bez diakritiky, jako log); plati do dalsiho volani.
 struct PresentFgInfo {
     int requested;               // pozadovany rezim (BMSD_FG_*)
@@ -101,6 +122,36 @@ struct PresentFgInfo {
 };
 void Present_FgInfo(PresentFgInfo* out);
 
+// ---- Kdy adaptivni rezim generuje ([fg] Preference, v103e, src/fgpref.inl) ----
+enum {
+    PREF_ALWAYS = 0,  // vzdy doplnit do cile (chovani do v103d: dolni / horni hranice FillBelow)
+    PREF_RESP = 1,    // prednost odezve: generovat jen pod 70 FPS hry, zisk aspon 40 %
+    PREF_BAL = 2,     // vyvazene (vychozi): pod 100 FPS, zisk aspon 25 %
+    PREF_SMOOTH = 3,  // plynulost: pod 130 FPS, zisk aspon 15 %
+    PREF_CUSTOM = 4,  // vlastni: pod PreferenceFps, zisk aspon 25 %
+    PREF_STEADY = 5,  // jen ini, pokus: stale FPS pro monitory se strobovanim (105 / 125, bez zisku, jen DLSS-G adaptivni)
+    PREF_COUNT
+};
+// Duvod pro menu: BMSD_PFW_* (bmsd_shared.h) a navic tyto (preference nerozhoduje)
+enum { PFI_ALWAYS = 16, PFI_NOEST = 17, PFI_WAIT = 18, PFI_OFF = 19 };
+struct PresentFgPref {
+    int pref;         // PREF_* (z ini / menu)
+    int prof;         // profil, ktery opravdu plati (steady mimo DLSS-G adaptivni -> vyvazene)
+    int why;          // BMSD_PFW_* nebo PFI_*
+    bool gen;         // helper prave generuje
+    float base;       // FPS hry bez generovani (zmereno, nebo odhad pri generovani; 0 = nezname)
+    float nOn, nOff;  // prah zapnuti / vypnuti (FPS hry)
+    float gain;       // zisk zobrazenych FPS v % (predpoved bez generovani, namereno pri generovani)
+    float gainMin;    // nejmensi zisk profilu v % (< 0 = profil zisk nepouziva)
+    float target;     // cil vystupu
+    bool rough;       // v103f (S10): base pri generovani je hruby odhad (omezeno GPU, < 2 vzorky kG -> spis nizko)
+};
+void Present_FgPrefInfo(PresentFgPref* out);
+int Present_FgGetPref();
+void Present_FgSetPref(int pref);
+int Present_FgGetPrefPct();  // v103f2: vlastni prah v % cile
+void Present_FgSetPrefPct(int pct);
+
 // ---- HUD-less vstup FG (K5, BMSD_PRESENT_VERSION 3, [fg] HudLess=1) ----
 // Vlastni RT velikosti a formatu backbufferu, do ktereho proxy v bode "konec post-processingu, pred HUD" zkopiruje
 // barvu sceny (StretchRect). nullptr = HUD-less ted netreba / nejde (FG negeneruje, menu, zaloha, [fg] HudLess=0).
@@ -109,3 +160,10 @@ IDirect3DSurface9* Present_HudlessTarget(IDirect3DDevice9* d);
 // do RT v tomto snimku, statistika). Predava se se snimkem v nejblizsim PostFrame.
 void Present_HudlessFrame(bool valid, unsigned snaps);
 void Present_NoteScene();  // konec sceny v tomto snimku ([fg] PresentStartSkip)
+
+// Hned po nacteni d3d9_dxvk.dll: [present] DxvkFse (vychozi 1) - swapchain DXVK bez zakazu celoobrazovkoveho flipu
+// (VkSurfaceFullScreenExclusiveInfoEXT DISALLOWED -> DEFAULT), jinak FG vypnuta jde jen pres kompozici DWM.
+void Present_HookDxvkVulkan(HMODULE dxvk, const wchar_t* iniPath);
+// proxy (menu.inl): kumulativni otaceni kamery, snimky s kamerou, pohyb mysi (raw input vlakna hry), hacek zprav
+// nainstalovan, aktivace hry podle WM_ACTIVATEAPP (1 / 0 / -1 = zatim zadna) - samokontrola "mys neotaci kamerou"
+void Proxy_CamInputTotals(double* turnDeg, unsigned* camFrames, uint64_t* mouseDist, bool* hooked, int* appActive);

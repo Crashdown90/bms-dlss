@@ -59,6 +59,11 @@ ULONGLONG g_gpRefreshAt;   // 0 = ceka na prvni swapchain, ~0 = hotovo
 DWORD g_gpRefreshMode = 4; // [fg] LiveRefreshMode: 1 = novy swapchain, 2 = okno hry WS_EX_LAYERED tam a zpet
                            // (oboji po LiveRefreshMs), 4 = WS_EX_LAYERED hned pri zapnuti (present.cpp)
 int g_gpRefreshStage;
+LONG g_gpScLost;  // swapchain presenteru vznikl pri g_atLostTop (alttab.inl); jen vlakno presenteru
+volatile LONG g_gpRefreshKick;  // hlavni vlakno: obnovu swapchainu presenteru provest hned ([fg] OffWindow)
+// Vlakno hry (ScHealComposed): swapchain presenteru i s povrchem znovu - zobrazeni jde pres kompozici DWM, ackoli
+// okno hry je v popredi a zabira cely monitor (swapchain vznikl, kdyz okno v popredi nebylo; v102x)
+volatile LONG g_gpRecreateReq;
 
 // Ladeni bit 11 (2048): zaznam presentu do bms_dlss_gptrace.csv (typ snimku, casy CPU a GPU v QPC). Zaznamenava od
 // spousti (soubor bms_dlss_gptrace.go ve slozce proxy, kontrola kazdych 5 s, soubor smaze) kGpTrMax presentu, pak
@@ -73,8 +78,10 @@ GpTrRec* g_gpTr;
 int g_gpTrN, g_gpTrSlot[3] = {-1, -1, -1};
 bool g_gpTrDone, g_gpTrOn;
 uint32_t g_gpCurFlags;   // gpFlags zverejneneho obrazu (cte vlakno spolu s gpPub)
+LONGLONG g_gpCurReal;    // gpRealQpc: postQpc skutecneho snimku, jehoz obsah obraz ukazuje (mereni latence)
+int g_gpLcSlot[3] = {-1, -1, -1};  // zaznam latchain.inl k pouziti slotu prikazu (konec kopie na GPU)
 LONGLONG g_gpCurWake;    // QPC probuzeni vlakna pro tento obraz
-LONGLONG g_gpCurPost;    // gpPostQpc tohoto obrazu (pri casnem zverejneni = cilovy cas presentu)
+LONGLONG g_gpCurPost;    // gpPostQpc / gpQPost tohoto obrazu (pri casnem zverejneni = cilovy cas presentu)
 HANDLE g_gpTimer;        // hi-res casovac vlakna presenteru (casna kopie: cekani na cilovy cas)
 VkQueryPool g_gpQp;
 double g_gpTsNs;         // ns na tik casove znacky GPU
@@ -121,6 +128,35 @@ unsigned g_gpStShown, g_gpStSkip, g_gpStNoWnd, g_gpStRecreate;
 LONGLONG g_gpStatQpc, g_gpLastPresQpc;
 Acc g_gpStIv;
 double g_gpStIvSq;  // soucet ctvercu intervalu (sd)
+// v103g: intervaly za interval statistiky (p1 / p99 a pocet mimo pasmo 0,75-1,33 x median: oko vidi jednotlive kratke /
+// dlouhe intervaly, ktere prumer a sd za 5 s skryji - ukazatel Hz monitoru 60-160 pri 102 FPS)
+static std::vector<float> g_gpIvBuf;
+// v103h: podil intervalu mimo pasmo za ~1 s (rytmus obrazu pro vyber nasobku pri nedosazitelnem cili, FgAdaptLock)
+static std::vector<float> g_gpQualBuf;
+static LONGLONG g_gpQualQ;
+static volatile LONG g_gpQualSeq;  // roste s kazdym oknem
+static volatile float g_gpQualPct; // % intervalu mimo 0,75-1,33 x median
+static volatile float g_gpQualMax; // nejdelsi interval (ms)
+static void GpQualPush(float iv, LONGLONG now) {
+    if (!g_gpQualQ) g_gpQualQ = now;
+    if (g_gpQualBuf.size() < 4096) g_gpQualBuf.push_back(iv);
+    if (now - g_gpQualQ < g_qpf.QuadPart || g_gpQualBuf.size() < 30) return;
+    g_gpQualQ = now;
+    std::vector<float>& b = g_gpQualBuf;
+    std::nth_element(b.begin(), b.begin() + b.size() / 2, b.end());
+    const float m = b[b.size() / 2];
+    float mx = 0.0f;
+    unsigned bad = 0;
+    for (float v : b) {
+        if (v < 0.75f * m || v > 1.33f * m) ++bad;
+        if (v > mx) mx = v;
+    }
+    g_gpQualPct = 100.0f * (float)bad / (float)b.size();
+    g_gpQualMax = mx;
+    b.clear();
+    MemoryBarrier();
+    ++g_gpQualSeq;
+}
 
 void GpSetFailed(const char* fmt, ...) {
     va_list ap;
@@ -282,13 +318,13 @@ bool GpInitDevice() {
     const char* prioExt = nullptr;
     static VkExtensionProperties ep[512];
     uint32_t ne = 0;
-    if (g_gpDebug & (2048 | 4096 | 8192)) {
+    if ((g_gpDebug & (2048 | 4096 | 8192)) || g_lcOn) {
         auto ede = (PFN_vkEnumerateDeviceExtensionProperties)gipa(g_gpInst, "vkEnumerateDeviceExtensionProperties");
         ne = 512;
         if (!ede || ede(g_gpPd, nullptr, &ne, ep) < 0) ne = 0;
     }
-    // Ladeni bit 12 (4096) / 13 (8192): globalni priorita fronty presentu HIGH / REALTIME (kopie a present nemaji cekat
-    // za praci hry a helperu na GPU)
+    // Bit 12 (4096) / 13 (8192), nebo [fg] GamePresentPriority 1 / 2 (v103f): globalni priorita fronty presentu
+    // HIGH / REALTIME (kopie a present nemaji cekat za praci hry a helperu na GPU)
     VkDeviceQueueGlobalPriorityCreateInfoKHR gpri = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR};
     if (g_gpDebug & (4096 | 8192)) {
         for (uint32_t i = 0; i < ne && !prioExt; ++i)
@@ -297,10 +333,10 @@ bool GpInitDevice() {
             if (!strcmp(ep[i].extensionName, "VK_EXT_global_priority")) prioExt = "VK_EXT_global_priority";
         if (prioExt) dext[ndext++] = prioExt;
         gpri.globalPriority = (g_gpDebug & 8192) ? VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR : VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
-        Log("prezentace: zobrazeni v procesu hry - ladeni: globalni priorita fronty %s (%s)",
+        Log("prezentace: zobrazeni v procesu hry - globalni priorita fronty %s (%s)",
             (g_gpDebug & 8192) ? "REALTIME" : "HIGH", prioExt ? prioExt : "rozsireni NENI");
     }
-    if (g_gpDebug & 2048) {  // ladeni: zaznam presentu - casove znacky GPU prevedene na QPC
+    if ((g_gpDebug & 2048) || g_lcOn) {  // zaznam presentu (ladeni) nebo mereni latence: casove znacky GPU na QPC
         auto gpp = (PFN_vkGetPhysicalDeviceProperties)gipa(g_gpInst, "vkGetPhysicalDeviceProperties");
         if (ne && gpp) {
             for (uint32_t i = 0; i < ne && !calName; ++i)
@@ -314,7 +350,8 @@ bool GpInitDevice() {
                 g_gpTsNs = pp.limits.timestampPeriod;
             }
         }
-        Log("prezentace: zobrazeni v procesu hry - ladeni: zaznam presentu, casove znacky GPU %s (perioda %.3f ns)",
+        Log("prezentace: zobrazeni v procesu hry - %s, casove znacky GPU %s (perioda %.3f ns)",
+            (g_gpDebug & 2048) ? "ladeni: zaznam presentu" : "mereni latence ([debug] LatChain)",
             calName ? calName : "NEJSOU", g_gpTsNs);
     }
     float prio = 1.0f;
@@ -578,9 +615,23 @@ bool GpEnsureSwapchain(ULONGLONG frameGap) {
         }
         // (pojistky helperu "znovu po pauze" a "znovu 1,5 s po startu" byly kvuli presentu z ciziho procesu - tady ne)
         (void)frameGap;
+        if (g_gpSc && InterlockedExchange(&g_gpRecreateReq, 0)) {
+            GpDestroySwapchain("obnova: zobrazeni pres kompozici DWM misto flipu");
+            gvk.vkDestroySurfaceKHR(g_gpInst, g_gpSurf, nullptr);
+            g_gpSurf = VK_NULL_HANDLE;
+            return false;
+        }
+        if (g_gpSc && g_gpScLost != g_atLostTop) {  // hra mimo popredi bez minimalizace / navrat (alttab.inl)
+            GpDestroySwapchain(g_atLostTop ? "hra neni v popredi a neminimalizovala se" : "hra zase v popredi");
+            gvk.vkDestroySurfaceKHR(g_gpInst, g_gpSurf, nullptr);
+            g_gpSurf = VK_NULL_HANDLE;
+            return false;
+        }
         // FG zapnuta za behu: posledni snimek DXVK v okne hry muze zustat v Independent Flip (displej ho dal
         // skenuje), swapchain presenteru jde pres "Composed: Copy with GPU GDI" a neni videt (pomuze Alt+Tab).
         // Jednou: DWM vyhodit z iFlip okna hry (WS_EX_LAYERED tam a zpet), za 150 ms novy swapchain i s povrchem.
+        if (g_gpSc && g_gpRefreshAt && g_gpRefreshAt != ~0ull && InterlockedExchange(&g_gpRefreshKick, 0))
+            g_gpRefreshAt = GetTickCount64();
         if (g_gpSc && g_gpRefreshAt && g_gpRefreshAt != ~0ull && GetTickCount64() >= g_gpRefreshAt) {
             if (g_gpRefreshStage == 0 && (g_gpRefreshMode & 2) && g_ctl && IsWindow(g_gameWnd)) {
                 PostMessageW(g_ctl, WMP_UNSTICK, (WPARAM)g_gameWnd, 0);
@@ -599,6 +650,7 @@ bool GpEnsureSwapchain(ULONGLONG frameGap) {
     }
     g_gpNeedRecreate = false;
     if (g_gpSc) return true;
+    g_gpScLost = g_atLostTop;
     const ULONGLONG now = GetTickCount64();
     if (now < g_gpInUseRetry) return false;
     VkSurfaceCapabilitiesKHR caps = {};
@@ -773,19 +825,32 @@ void GpProcess(uint64_t seq) {
     const int c = g_gpCi;
     g_gpCi = (g_gpCi + 1) % kGpCmd;
     if (g_gpFenceUsed[c]) {
-        if (gvk.vkWaitForFences(g_gpDev, 1, &g_gpFence[c], VK_TRUE, 2000000000ull) != VK_SUCCESS)
+        // Pomale PC (strankovani VRAM pri nacitani): GPU smi stat i sekundy - cekat po krocich s logem do 20 s.
+        // Skutecne zaseknuti konci pres TDR ztratou zarizeni (fence pak hned vrati chybu).
+        VkResult wr = gvk.vkWaitForFences(g_gpDev, 1, &g_gpFence[c], VK_TRUE, 2000000000ull);
+        if (wr == VK_TIMEOUT) {
+            Log("prezentace: WARN - GPU zatim nedobehla kopii do swapchainu (2 s), cekam dal (nejvys 20 s)");
+            for (int i = 0; i < 9 && wr == VK_TIMEOUT; ++i)
+                wr = gvk.vkWaitForFences(g_gpDev, 1, &g_gpFence[c], VK_TRUE, 2000000000ull);
+            Log("prezentace: kopie do swapchainu %s (VkResult %d)", wr == VK_SUCCESS ? "dobehla" : "NEDOBEHLA", (int)wr);
+        }
+        if (wr != VK_SUCCESS)
             return GpSetFailed("GPU nedobehla (kopie do swapchainu)");
         gvk.vkResetFences(g_gpDev, 1, &g_gpFence[c]);
         g_gpFenceUsed[c] = false;
     }
-    if (g_gpTrSlot[c] >= 0) {  // ladeni: casove znacky predchoziho pouziti slotu
+    if (g_gpTrSlot[c] >= 0 || g_gpLcSlot[c] >= 0) {  // casove znacky predchoziho pouziti slotu (ladeni, latence)
         uint64_t ts[2] = {};
         GpTrCalib();
         if (g_gpGetQp(g_gpDev, g_gpQp, (uint32_t)c * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-            g_gpTr[g_gpTrSlot[c]].g0 = GpTrToQpc(ts[0]);
-            g_gpTr[g_gpTrSlot[c]].g1 = GpTrToQpc(ts[1]);
+            if (g_gpTrSlot[c] >= 0) {
+                g_gpTr[g_gpTrSlot[c]].g0 = GpTrToQpc(ts[0]);
+                g_gpTr[g_gpTrSlot[c]].g1 = GpTrToQpc(ts[1]);
+            }
+            LcDispSet(g_gpLcSlot[c], 0, 0, GpTrToQpc(ts[1]));
         }
         g_gpTrSlot[c] = -1;
+        g_gpLcSlot[c] = -1;
     }
     GpTrRec* tr = nullptr;
     if (g_gpTr && !g_gpTrDone && g_gpTrOn) {
@@ -795,7 +860,7 @@ void GpProcess(uint64_t seq) {
             tr = &g_gpTr[g_gpTrN++];
             tr->seq = seq;
             tr->flags = g_gpCurFlags;
-            tr->post = (LONGLONG)g_sh->gpPostQpc;
+            tr->post = g_gpCurPost;
             tr->wake = g_gpCurWake;
         }
     }
@@ -811,8 +876,9 @@ void GpProcess(uint64_t seq) {
             r = gvk.vkAcquireNextImageKHR(g_gpDev, g_gpSc, 0, g_gpAcq[c], VK_NULL_HANDLE, &idx);
         }
         for (int tries = 0; r == VK_NOT_READY || r == VK_TIMEOUT; ++tries) {  // bez cekani pod zamkem fronty DXVK
-            if (tries >= 100) break;
-            Sleep(1);
+            if (tries >= (g_fgFree ? 400 : 100)) break;
+            if (g_fgFree) GpSleepUntil(Qpc() + g_qpf.QuadPart / 4000);  // rucni cil nad stropem VRR: kratsi krok (0,25 ms)
+            else Sleep(1);
             GpQLock lk;
             r = gvk.vkAcquireNextImageKHR(g_gpDev, g_gpSc, 0, g_gpAcq[c], VK_NULL_HANDLE, &idx);
         }
@@ -835,7 +901,7 @@ void GpProcess(uint64_t seq) {
         tr->acq = Qpc();
         tr->idx = acquired ? idx : 99u;
     }
-    const bool trTs = tr && g_gpQp;
+    const bool trTs = (tr || g_lcOn) && g_gpQp;
     VkCommandBuffer cmd = g_gpCmdB[c];
     const bool noImp = (g_gpDebug & 128) != 0;
     const bool dbgClear = (g_gpDebug & 1) != 0 || noImp, dbgCpuWait = (g_gpDebug & 2) != 0 || noImp,
@@ -943,7 +1009,9 @@ void GpProcess(uint64_t seq) {
     }
     if (r != VK_SUCCESS) return GpSetFailed("vkQueueSubmit %s", VkStr(r));
     g_gpFenceUsed[c] = true;
-    if (trTs && acquired && !dbgClear) g_gpTrSlot[c] = (int)(tr - g_gpTr);
+    if (tr && trTs && acquired && !dbgClear) g_gpTrSlot[c] = (int)(tr - g_gpTr);
+    const int lci = acquired ? LcDispBegin(g_gpCurReal, (g_gpCurFlags & 1u) != 0) : -1;
+    if (trTs && acquired && !dbgClear) g_gpLcSlot[c] = lci;
     if (dbgCpuSig && !(g_gpDebug & 128)) {  // ladeni: gpSemDone z CPU az po dokonceni prace (fence)
         if (gvk.vkWaitForFences(g_gpDev, 1, &g_gpFence[c], VK_TRUE, 1000000000ull) != VK_SUCCESS)
             return GpSetFailed("ladeni: fence kopie nedobehla");
@@ -975,11 +1043,15 @@ void GpProcess(uint64_t seq) {
         tr->p0 = p0;
         tr->p1 = p1;
     }
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) LcDispSet(lci, p0, p1, 0);
     g_gpStPres.add(Ms(p0, p1));
+    if (g_dgOn && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) DgPush(g_dgMon, p0);  // v103g: diagnosticky prekryv
     if (g_gpLastPresQpc && Ms(g_gpLastPresQpc, p0) < 200.0) {
         const double iv = Ms(g_gpLastPresQpc, p0);
         g_gpStIv.add(iv);
         g_gpStIvSq += iv * iv;
+        if (g_gpIvBuf.size() < 8192) g_gpIvBuf.push_back((float)iv);
+        if (g_fgFree) GpQualPush((float)iv, p0);
     }
     g_gpLastPresQpc = p0;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
@@ -1020,13 +1092,28 @@ void GpStats() {
     ++g_sh->gpStatSeq;
     const double ivVar = g_gpStIv.n ? g_gpStIvSq / g_gpStIv.n - g_gpStIv.avg() * g_gpStIv.avg() : 0.0;
     const double ivSd = ivVar > 0.0 ? sqrt(ivVar) : 0.0;
+    double ivMed = 0.0, ivP1 = 0.0, ivP99 = 0.0;
+    unsigned ivShort = 0, ivLong = 0;
+    if (!g_gpIvBuf.empty()) {
+        std::vector<float>& b = g_gpIvBuf;
+        std::sort(b.begin(), b.end());
+        const size_t n = b.size();
+        ivMed = b[n / 2];
+        ivP1 = b[std::min(n - 1, n / 100)];
+        ivP99 = b[std::min(n - 1, n * 99 / 100)];
+        for (float v : b) {
+            if (v < 0.75 * ivMed) ++ivShort;
+            else if (v > 1.33 * ivMed) ++ivLong;
+        }
+    }
+    g_gpIvBuf.clear();
     if (g_gpStShown || g_gpStSkip || g_gpStNoWnd)
         Log("prezentace: zobrazeni v procesu hry %.1f s: zobrazeno %u (%.1f/s), preskoceno %u, bez okna %u, swapchain "
             "%ux%u %s (novy %u) | probuzeni %.3f / %.2f ms, vkQueuePresent %.3f / %.2f ms, interval %.2f ms (sd %.3f, "
-            "max %.2f)",
+            "max %.2f; median %.2f, p1 / p99 %.2f / %.2f, mimo pasmo 0.75-1.33 x median: kratke %u, dlouhe %u)",
             el / 1000.0, g_gpStShown, g_gpStShown * 1000.0 / el, g_gpStSkip, g_gpStNoWnd, g_gpScExt.width,
             g_gpScExt.height, GpModeStr(g_gpScMode), g_gpStRecreate, g_gpStWake.avg(), g_gpStWake.max,
-            g_gpStPres.avg(), g_gpStPres.max, g_gpStIv.avg(), ivSd, g_gpStIv.max);
+            g_gpStPres.avg(), g_gpStPres.max, g_gpStIv.avg(), ivSd, g_gpStIv.max, ivMed, ivP1, ivP99, ivShort, ivLong);
     g_gpStPres = g_gpStWake = g_gpStIv = Acc();
     g_gpStIvSq = 0;
     g_gpStShown = g_gpStSkip = g_gpStNoWnd = g_gpStRecreate = 0;
@@ -1063,18 +1150,27 @@ DWORD WINAPI GpThreadProc(void*) {
         const uint64_t seq = pub & 0xFFFFFFFFFFFFull;
         const uint32_t pg = (uint32_t)(pub >> 48);
         if (seq && seq != g_gpLastSeq && g_gpImpGen && pg == ((uint32_t)g_gpImpGen & 0xFFFFu)) {
-            if (g_gpLastSeq && seq > g_gpLastSeq + 1) {
-                g_gpStSkip += (unsigned)(seq - g_gpLastSeq - 1);
-                g_sh->gpSkipped += (uint32_t)(seq - g_gpLastSeq - 1);
+            // Rucni cil nad stropem VRR (v103h): obrazy po poradi. Helper slot neprepise, dokud ho proxy neprecetla
+            // (gpSemDone), takze cekajicich je nejvys BMSD_GP_IMAGES. Jinak jako driv jen posledni zverejneny.
+            uint64_t s0 = seq;
+            if ((g_sh->gpFlags & 4u) && g_gpLastSeq && seq > g_gpLastSeq)
+                s0 = std::max(g_gpLastSeq + 1, seq >= BMSD_GP_IMAGES ? seq - BMSD_GP_IMAGES + 1 : 1);
+            if (g_gpLastSeq && s0 > g_gpLastSeq + 1) {
+                g_gpStSkip += (unsigned)(s0 - g_gpLastSeq - 1);
+                g_sh->gpSkipped += (uint32_t)(s0 - g_gpLastSeq - 1);
             }
-            g_gpLastSeq = seq;
-            const LONGLONG post = (LONGLONG)g_sh->gpPostQpc;
-            const LONGLONG t = Qpc();
-            g_gpCurFlags = g_sh->gpFlags;
-            g_gpCurWake = t;
-            g_gpCurPost = post;
-            if (post && t > post && Ms(post, t) < 100.0) g_gpStWake.add(Ms(post, t));
-            GpProcess(seq);
+            for (uint64_t s = s0; s <= seq && !g_gpFailed && !g_gpQuit; ++s) {
+                g_gpLastSeq = s;
+                const int k = (int)(s % BMSD_GP_IMAGES);
+                const LONGLONG post = (LONGLONG)g_sh->gpQPost[k];
+                const LONGLONG t = Qpc();
+                g_gpCurFlags = g_sh->gpQFlags[k];
+                g_gpCurReal = (LONGLONG)g_sh->gpQReal[k];
+                g_gpCurWake = t;
+                g_gpCurPost = post;
+                if (post && t > post && Ms(post, t) < 100.0) g_gpStWake.add(Ms(post, t));
+                GpProcess(s);
+            }
             if (g_gpFailed) break;
         } else if (g_gpSc && !(g_gpDebug & 32768)) {
             // Bez noveho snimku: hra na cele obrazovce po minimalizaci (Alt+Tab) hned prestane kreslit, takze by se
@@ -1085,8 +1181,9 @@ DWORD WINAPI GpThreadProc(void*) {
                 GpDestroySwapchain("okno zniceno (bez snimku)");
                 GpSetState(BMSD_PST_NOWINDOW);
             } else if (IsIconic(GetAncestor(g_gpWnd, GA_ROOT)) || !IsWindowVisible(g_gpWnd) ||
-                       !GetClientRect(g_gpWnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
-                GpDestroySwapchain("okno minimalizovane / skryte / 0x0 (bez snimku)");
+                       !GetClientRect(g_gpWnd, &rc) || rc.right <= 0 || rc.bottom <= 0 ||
+                       (g_atLostTop && g_gpScLost == 0)) {
+                GpDestroySwapchain("okno minimalizovane / skryte / 0x0 / neni v popredi (bez snimku)");
                 GpSetState(BMSD_PST_NOWINDOW);
             }
         }

@@ -235,10 +235,10 @@ static_assert(sizeof(BmsdShared) == 896, "BmsdShared");
 // M znovu pouzije az pri helperAck >= M (na GPU pak ceka semDone >= M); helper bere vzdy jen posledni zverejneny
 // snimek.
 #define BMSD_PRESENT_MAGIC 0x50534D42u  // "BMSP"
-#define BMSD_PRESENT_VERSION 7  // 7 = zobrazeni v procesu hry (gp*), 3 = HUD-less vstup FG (K5, hudless[]), 4 = nasobek FG 2x / 3x / 4x a citace snimku,
+#define BMSD_PRESENT_VERSION 12  // 12 = libovolny cil vystupu (outCapMilli, fronta obrazu presenteru gpQ*), 11 = preference adaptivnich rezimu (adaptPref), 10 =obsah zobrazovaneho slotu pro mereni latence (gpRealQpc), 9 = cena generatoru a duvod prepnuti adaptivniho rezimu (fgCost*, adaptReason), 8 = cisla helperu pro samokontroly (sc*), 7 = zobrazeni v procesu hry (gp*), 3 = HUD-less vstup FG (K5, hudless[]), 4 = nasobek FG 2x / 3x / 4x a citace snimku,
                                 // 5 = FG zap / vyp za behu (restartSeq), 6 = adaptivni FSR FG (adapt*)
 #define BMSD_PRESENT_IMAGES 3
-#define BMSD_GP_IMAGES 3
+#define BMSD_GP_IMAGES 5  // od verze 12 (driv 3): fronta obrazu pri vysokem cili vystupu
 
 // BmsdPresentShared::helperState
 enum {
@@ -259,6 +259,8 @@ enum {
                            // vedle helperu; na vsech GPU FSR FG 3.1.x)
     BMSD_FG_FSRADAPT = 3,  // FSR FG adaptivni: vlastni FSR 3.1.4 s libovolnym casem t (src/helper/afg, staticky v helperu)
                            // doplni jen tolik generovanych snimku, kolik chybi do cile FPS
+    BMSD_FG_DLSSGADAPT = 4,  // DLSS-G adaptivni: stejny rozvrh jako FSR adaptivni, mezisnimky z DLSS-G v casech
+                             // k / (n + 1), n <= 5 (jen GPU s DLSS-G nad 2x; fgAvailMask bit 4)
     BMSD_FG_COUNT
 };
 
@@ -359,7 +361,8 @@ struct BmsdPresentShared {
     uint32_t adaptTargetMilli; // proxy: cil vystupu v tisicinach FPS (TargetFps nebo auto f - f^2/3600 minus rezerva)
     uint32_t refreshMilli;     // proxy: obnovovaci frekvence monitoru okna hry v mHz (0 = nezjistena)
     uint32_t adaptFillMilli;   // proxy: A - generovat az pod touto hranici skutecnych FPS (0 = auto 90 % cile)
-    uint32_t adaptPacing;      // proxy: vzdy 0 = rozvrh A (B odstranen ve v24z4; pole zustava kvuli rozlozeni)
+    uint32_t adaptLock;        // proxy: zlomkovy zamek ([fg] AdaptLock): p | q << 8 = limiter drzi skutecne snimky na
+                               // cil * q / p (napr. 3 | 2 << 8 = 2/3 cile), 0 = bez zamku. (Drive adaptPacing = 0.)
     uint32_t adaptRealCap;     // proxy: strop skutecnych FPS (limiter v proxy; 0 = jen cil); helperu jen pro log
     uint32_t adaptEngaged;     // helper: 1 = adaptivni rezim prave generuje, 0 = jen skutecne (nad cilem / mrtva zona)
     // ---- Od verze 7: zobrazeni v procesu hry ([fg] GamePresent=1, vychozi) ----
@@ -389,7 +392,71 @@ struct BmsdPresentShared {
     uint32_t gpStatSeq;         // proxy: zvysi po zapisu statistiky
     uint32_t gpSkipped;         // proxy: preskocenych obrazu celkem (vlakno pozadu, jina generace)
     char gpMsg[128];            // proxy: posledni chyba presenteru proxy
+    // ---- Od verze 8: cisla helperu pro samokontroly proxy ([debug] SelfCheck), plati se statSeq (interval ~5 s) ----
+    uint32_t scDropped;         // helper: polozky (skutecny snimek se svymi mezisnimky) zahozene pred zobrazenim - vlakno
+                                // presentu pozadu (fronta plna) nebo prace na GPU nehotova do 250 ms
+    uint32_t scGenSkipped;      // helper: generovane snimky vynechane (vlakno pozadu) nebo nezobrazene
+    uint32_t scAdSlots;         // helper, adaptivni rezimy: sloty mrizky rozvrhu A v intervalu (0 = jen skutecne snimky)
+    uint32_t scAdSlotsLost;     // helper, adaptivni: sloty bez obrazu (vic slotu na par nez obrazu, DLSS-G vynechano)
+                                // nebo zahozene pozde
+    uint32_t scAdSwitches;      // helper, adaptivni: prepnuti generuje <-> jen skutecne v intervalu
+    uint32_t scAdCostOverMs;    // helper, adaptivni: jak dlouho v kuse (ms) generuje, ackoli odhad skutecnych FPS bez
+                                // generatoru je nad hranici vypnuti a vypnuti podle odhadu neni blokovane (0 = ne)
+    float scAdCostEst;          // helper, adaptivni: odhad skutecnych FPS bez generatoru (0 = neni)
+    float scAdCostLimit;        // helper, adaptivni: hranice vypnuti podle odhadu (1,08 x horni hranice)
+    // ---- Od verze 9: mereni pro "FG jen tam, kde se vyplati" (krok 0, jen log proxy "odhad FG", src/fgest.inl) ----
+    float fgCostQ1Ms;           // helper, adaptivni: cena generatoru na GPU na skutecny snimek (casova razitka), dolni
+                                // kvartil poslednich 64 vzorku (ms); plati s fgCostCount > 0
+    float fgCostMeanMs;         // helper: prumer tychz 64 vzorku (ms)
+    float fgCostEmaMs;          // helper: EMA ceny (alfa 0,05), podle ktere helper vypina zbytecne generovani (v102t)
+    uint32_t fgCostCount;       // helper: vzorku ceny od startu (roste s kazdym; zapisuje se posledni)
+    uint32_t fgCostMode;        // helper: rezim BMSD_FG_*, ke kteremu cena patri (pri zmene rezimu se vzorky zahodi)
+    uint32_t adaptReason;       // helper, adaptivni: duvod posledniho prepnuti (BMSD_ADR_*), bit 8 = dalsi zapnuti
+                                // blokovane (backoff po neuzitecnem generovani)
+    // ---- Od verze 10: mereni latence vstup -> zobrazeni (proxy src/latchain.inl, Impulse krok A) ----
+    uint64_t gpRealQpc;         // helper: postQpc skutecneho snimku, jehoz obsah zverejneny obraz ukazuje (u
+                                // generovaneho novejsi snimek paru); zapisuje se pred gpPub spolu s gpFlags
+    // ---- Od verze 11: "FG jen tam, kde se vyplati" ([fg] Preference, src/fgpref.inl; docs/vyzkum-fg-kde-se-vyplati.md
+    // kap. 2.3, 10.3) ----
+    uint32_t adaptPref;         // proxy, adaptivni rezimy: bit 0 = rozhoduje preference (helper pak nepouziva dolni /
+                                // horni hranici ani svuj odhad ceny, jen bit 1 a vlastni kontrolu uzitecnosti),
+                                // bit 1 = generovat (jinak jen skutecne); 0 = jako drive (Preference=always, odhad
+                                // nedostupny). Bity 8..15 = duvod (BMSD_PFW_*, jen log helperu)
+    uint32_t outCapMilli;       // od verze 12 (driv rezerva): proxy: nejvyssi okamzity vystup presenteru v tisicinach FPS
+                                // (nejkratsi interval mezi presenty). Auto nebo rucni cil pod stropem VRR: f - f^2/3600;
+                                // rucni cil nad nim: 2 x cil (jen pojistka proti dvojici obrazu); 0 = bez omezeni
+    // ---- Od verze 12: fronta obrazu pro presenter v procesu hry (rucni cil nad stropem VRR) ----
+    // Ke kazdemu obrazu gpImg[seq % BMSD_GP_IMAGES] vlastni cas, priznaky a skutecny snimek; zapisuje se pred gpPub. Slot
+    // se neprepise, dokud proxy nesignalizuje gpSemDone >= jeho seq. gpFlags bit 2 = proxy zobrazi vsechny zverejnene
+    // obrazy po poradi (jinak jako driv jen posledni).
+    uint64_t gpQPost[BMSD_GP_IMAGES];
+    uint64_t gpQReal[BMSD_GP_IMAGES];
+    uint32_t gpQFlags[BMSD_GP_IMAGES];
+    uint32_t gpQueue;           // proxy: 1 = zobrazovat po poradi (rucni cil nad stropem VRR)
 };
 #pragma pack(pop)
-static_assert(sizeof(BmsdPresentShared) == 1256, "BmsdPresentShared");
+static_assert(sizeof(BmsdPresentShared) == 1496, "BmsdPresentShared");
+
+// BmsdPresentShared::adaptReason (dolni bajt)
+enum {
+    BMSD_ADR_NONE = 0,     // od startu / resetu nezapnuto (skutecne FPS nad dolni hranici)
+    BMSD_ADR_BELOW = 1,    // generuje: skutecne FPS pod dolni hranici
+    BMSD_ADR_ABOVE = 2,    // jen skutecne: skutecne FPS nad horni hranici
+    BMSD_ADR_COST = 3,     // jen skutecne: odhad bez generatoru nad hranici vypnuti (hra by cil stihla, v102t)
+    BMSD_ADR_USELESS = 4,  // jen skutecne: generovani snimky nepridavalo (zobrazeno < 1,1 na skutecny)
+    BMSD_ADR_PREF_ON = 5,  // generuje: podle preference (adaptPref bit 1)
+    BMSD_ADR_PREF_OFF = 6  // jen skutecne: podle preference
+};
+// BmsdPresentShared::adaptPref bity 8..15: duvod rozhodnuti preference (proxy src/fgpref.inl; log a menu)
+enum {
+    BMSD_PFW_NONE = 0,     // zatim bez rozhodnuti (meri se)
+    BMSD_PFW_GEN = 1,      // generuje: hra pod prahem profilu a zisk staci
+    BMSD_PFW_ABOVE = 2,    // jen skutecne: hra nad prahem profilu
+    BMSD_PFW_GAIN = 3,     // jen skutecne: zisk zobrazenych FPS pod minimem profilu
+    BMSD_PFW_TARGET = 4,   // jen skutecne: hra stiha cil sama
+    BMSD_PFW_HOLD = 5,     // v pasmu hystereze nebo pred minimalni dobou ve stavu: stav drzi
+    BMSD_PFW_GUARD = 6,    // pauza, nacitani, Alt+Tab, menu: stav se nemeni
+    BMSD_PFW_USELESS = 7,  // helper vypnul generovani jako neuzitecne (backoff)
+    BMSD_PFW_BLOCK = 8     // vypnuti podle odhadu blokovane (odhad nevysel, backoff)
+};
 static_assert(offsetof(BmsdPresentShared, gpPub) % 8 == 0, "gpPub");
